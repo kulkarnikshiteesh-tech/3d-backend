@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import traceback
 import os
 import shutil
 import tempfile
@@ -7,13 +8,13 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from starlette.staticfiles import StaticFiles
 
-APP_DIR = Path(__file__).resolve().parent
-STATIC_DIR = APP_DIR / "static"
-os.makedirs(STATIC_DIR, exist_ok=True)
+STATIC_DIR = Path("static")
+os.makedirs("static", exist_ok=True)
 
 app = FastAPI()
 
@@ -26,6 +27,14 @@ app.add_middleware(
 )
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    error_msg = f"{type(exc).__name__}: {str(exc)}"
+    print(f"CRITICAL ERROR: {error_msg}")
+    print(traceback.format_exc())
+    return JSONResponse(status_code=500, content={"detail": error_msg})
 
 
 def _call_with_fallbacks(func: Callable[..., Any], fallbacks: list[tuple[tuple[Any, ...], dict[str, Any]]]) -> None:
@@ -127,7 +136,7 @@ async def upload_step(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Only .step/.stp files are supported")
 
     # Ensure static directory exists before we attempt to write into it.
-    os.makedirs(STATIC_DIR, exist_ok=True)
+    os.makedirs("static", exist_ok=True)
 
     tmp_step_path = Path(tempfile.gettempdir()) / f"{uuid4()}{suffix}"
     glb_name = f"{uuid4()}.glb"
@@ -153,21 +162,15 @@ async def upload_step(file: UploadFile = File(...)):
     except HTTPException:
         # Re-raise known HTTP errors unchanged.
         raise
-    except Exception as e:
+    except Exception:
+        # Clean up partially-written outputs, but let the global exception handler
+        # print the traceback and return the exact error message.
         if glb_path.exists():
             try:
                 glb_path.unlink()
             except Exception:
                 pass
-        # Return the exact error information in the 500 response.
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "message": "Upload/convert failed",
-                "error": str(e),
-                "error_type": e.__class__.__name__,
-            },
-        ) from e
+        raise
     finally:
         try:
             await file.close()
