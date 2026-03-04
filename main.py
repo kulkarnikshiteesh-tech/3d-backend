@@ -67,20 +67,20 @@ def analyze_undercuts(mesh) -> dict:
         reachable = np.zeros(len(normals), dtype=bool)
         for d in directions:
             dot = np.dot(normals, d)
-            reachable |= (dot > 0.15)
+            reachable |= (dot > 0.25)
 
         unreachable_area = float(np.sum(areas[~reachable]))
         ratio = unreachable_area / total_area if total_area > 0 else 0
         pct = ratio * 100
 
-        if ratio > 0.06:
+        if ratio > 0.03:
             return {
                 "has_undercuts": True,
                 "undercut_face_count": int(np.sum(~reachable)),
                 "undercut_severity": "high",
                 "undercut_message": f"Undercut detected — {pct:.1f}% of surface area is not reachable from any pull direction. Side-action sliders required, increasing tooling cost by ~25–40%.",
             }
-        elif ratio > 0.02:
+        elif ratio > 0.01:
             return {
                 "has_undercuts": True,
                 "undercut_face_count": int(np.sum(~reachable)),
@@ -166,6 +166,7 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
 
 
 
