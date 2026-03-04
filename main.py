@@ -79,20 +79,18 @@ def analyze_step_features(step_text: str) -> dict:
         n_likely_holes = sum(1 for r in radii_floats if r < 15.0)
         n_likely_bosses = sum(1 for r in radii_floats if r >= 15.0)
 
-        # Through-hole detection: a cylinder referenced by TWO face bounds
-        # is almost certainly a through-hole (undercut for straight pull)
-        # We find cylinder entity IDs and check how many FACE_OUTER_BOUND reference them
-        cyl_ids = re.findall(
-            r"#(\d+)\s*=\s*CYLINDRICAL_SURFACE\s*\(",
-            step_text,
-            re.IGNORECASE,
-        )
-        through_hole_count = 0
-        for cid in cyl_ids:
-            # Count how many ADVANCED_FACE entries reference this cylinder
-            refs = re.findall(rf"ADVANCED_FACE\s*\([^)]*#{cid}[^)]*\)", step_text)
-            if len(refs) >= 2:
-                through_hole_count += 1
+        # Through-hole detection: cylinder referenced by EXACTLY 2 faces (sidewall only)
+cyl_ids = re.findall(
+    r"#(\d+)\s*=\s*CYLINDRICAL_SURFACE\s*\(",
+    step_text,
+    re.IGNORECASE,
+)
+through_hole_count = 0
+for cid in cyl_ids:
+    refs = re.findall(rf"ADVANCED_FACE\s*\([^)]*#{cid}[^)]*\)", step_text)
+    # EXACTLY 2 faces = through-hole (2 sidewalls). More = blind hole with bottom
+    if len(refs) == 2:
+        through_hole_count += 1
 
         has_undercut_features = (
             through_hole_count > 0 or n_conicals > 0
@@ -277,4 +275,5 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
 
