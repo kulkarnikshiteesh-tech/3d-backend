@@ -72,14 +72,14 @@ def analyze_undercuts(mesh: trimesh.Trimesh) -> dict:
             if ratio < best_undercut_ratio:
                 best_undercut_ratio = ratio
 
-        if best_undercut_ratio > 0.20:
+        if best_undercut_ratio > 0.30:
             return {
                 "has_undercuts": True,
                 "undercut_face_count": int(np.sum(np.dot(normals, pull_directions[0]) < -0.3)),
                 "undercut_severity": "high",
                 "undercut_message": f"High undercut risk — {best_undercut_ratio*100:.0f}% of surface area is occluded from best pull direction. Side-action sliders likely required, increasing tooling cost by ~25–40%.",
             }
-        elif best_undercut_ratio > 0.08:
+        elif best_undercut_ratio > 0.11:
             return {
                 "has_undercuts": True,
                 "undercut_face_count": int(np.sum(np.dot(normals, pull_directions[0]) < -0.3)),
@@ -162,6 +162,7 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
 
 
 
