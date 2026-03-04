@@ -47,51 +47,53 @@ async def health():
 
 def analyze_undercuts(mesh: trimesh.Trimesh) -> dict:
     try:
-        normals = mesh.face_normals
-        areas = mesh.area_faces
+        mesh.process(validate=True)
+        if not isinstance(mesh, trimesh.Trimesh):
+            mesh = mesh.dump(concatenate=True)
 
-        pull_directions = [
-            np.array([0, 0, 1]),
-            np.array([0, 0, -1]),
-            np.array([1, 0, 0]),
-            np.array([-1, 0, 0]),
-            np.array([0, 1, 0]),
-            np.array([0, -1, 0]),
-        ]
+        pull_dir = np.array([0.0, 0.0, 1.0])
 
-        best_undercut_ratio = 1.0
+        points, face_indices = trimesh.sample.sample_surface_even(mesh, 1000)
+        normals = mesh.face_normals[face_indices]
 
-        for pull in pull_directions:
-            # Faces facing away from pull direction = potential undercuts
-            dot = np.dot(normals, pull)
-            # A face is an undercut if it faces significantly OPPOSITE to pull
-            undercut_mask = dot < -0.3
-            undercut_area = float(np.sum(areas[undercut_mask]))
-            total_area = float(np.sum(areas))
-            ratio = undercut_area / total_area if total_area > 0 else 0
-            if ratio < best_undercut_ratio:
-                best_undercut_ratio = ratio
+        undercut_hits = 0
+        checked = 0
 
-        if best_undercut_ratio > 0.30:
+        for point, normal in zip(points, normals):
+            if np.dot(normal, pull_dir) > 0.3:
+                continue
+            checked += 1
+
+            origin = point + pull_dir * 0.1
+            locations, _, _ = mesh.ray.intersects_location(
+                ray_origins=np.array([origin]),
+                ray_directions=np.array([pull_dir])
+            )
+            if len(locations) > 0:
+                undercut_hits += 1
+
+        ratio = undercut_hits / checked if checked > 0 else 0
+
+        if ratio > 0.25:
             return {
                 "has_undercuts": True,
-                "undercut_face_count": int(np.sum(np.dot(normals, pull_directions[0]) < -0.3)),
+                "undercut_face_count": undercut_hits,
                 "undercut_severity": "high",
-                "undercut_message": f"High undercut risk — {best_undercut_ratio*100:.0f}% of surface area is occluded from best pull direction. Side-action sliders likely required, increasing tooling cost by ~25–40%.",
+                "undercut_message": f"High undercut risk — {undercut_hits} points blocked from pull direction. Side-action sliders likely required, increasing tooling cost by ~25–40%.",
             }
-        elif best_undercut_ratio > 0.11:
+        elif ratio > 0.10:
             return {
                 "has_undercuts": True,
-                "undercut_face_count": int(np.sum(np.dot(normals, pull_directions[0]) < -0.3)),
+                "undercut_face_count": undercut_hits,
                 "undercut_severity": "moderate",
-                "undercut_message": f"Moderate undercut risk — {best_undercut_ratio*100:.0f}% of surface area may be occluded. Review part for side holes or overhangs.",
+                "undercut_message": f"Moderate undercut risk — {undercut_hits} points may be occluded. Review part for side holes or overhangs.",
             }
         else:
             return {
                 "has_undercuts": False,
-                "undercut_face_count": 0,
+                "undercut_face_count": undercut_hits,
                 "undercut_severity": "low",
-                "undercut_message": f"No undercut risk — part is fully compatible with straight-pull mold.",
+                "undercut_message": "No undercut risk — part is fully compatible with straight-pull mold.",
             }
     except Exception as e:
         return {
@@ -100,6 +102,7 @@ def analyze_undercuts(mesh: trimesh.Trimesh) -> dict:
             "undercut_severity": "unknown",
             "undercut_message": "Undercut analysis could not be completed for this part.",
         }
+
 
 @app.post("/upload")
 async def upload_step(file: UploadFile = File(...)):
@@ -162,8 +165,3 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
-
-
-
-
-
