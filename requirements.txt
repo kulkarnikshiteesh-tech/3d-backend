@@ -2,5 +2,6 @@ fastapi
 uvicorn
 python-multipart
 trimesh
-ezdxf
-gmsh
+numpy
+pythonocc-core
+
