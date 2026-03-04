@@ -55,15 +55,20 @@ async def upload_step(file: UploadFile = File(...)):
         with tmp_step_path.open("wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        # Load the STEP file directly with trimesh; cascadio is used under the hood.
-        mesh = trimesh.load(str(tmp_step_path), force="mesh")
+        # 1. Load the STEP file as a scene so we can handle assemblies.
+        scene = trimesh.load(str(tmp_step_path), force="scene")
 
-        # Assumes the geometry is in millimeters.
-        extents = [float(x) for x in mesh.extents]
-        volume = float(mesh.volume)
+        # 2. Export the entire scene to GLB.
+        scene.export(file_obj=glb_path, file_type="glb")
 
-        # Export the mesh to GLB in the static directory.
-        mesh.export(glb_path)
+        # 3. Calculate total volume and bounding box from all meshes in the scene.
+        volume = 0.0
+        extents_raw = scene.extents if getattr(scene, "extents", None) is not None else [0, 0, 0]
+        extents = [float(x) for x in extents_raw]
+
+        for geometry in scene.geometry.values():
+            if hasattr(geometry, "volume"):
+                volume += float(geometry.volume)
 
         return {
             "glb_url": f"/static/{glb_name}",
