@@ -7,6 +7,7 @@ import traceback
 from pathlib import Path
 from uuid import uuid4
 
+import gmsh
 import trimesh
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -55,20 +56,42 @@ async def upload_step(file: UploadFile = File(...)):
         with tmp_step_path.open("wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        # 1. Load the STEP file as a scene so we can handle assemblies.
-        scene = trimesh.load(str(tmp_step_path), force="scene")
+        # Convert STEP -> triangulated mesh via gmsh, then use trimesh for properties + GLB export.
+        tmp_stl_path = tmp_step_path.with_suffix(".stl")
+        try:
+            # Initialize gmsh
+            gmsh.initialize()
+            gmsh.option.setNumber("General.Terminal", 0)
 
-        # 2. Export the entire scene to GLB.
-        scene.export(file_obj=glb_path, file_type="glb")
+            # Load the step file
+            gmsh.merge(str(tmp_step_path))
 
-        # 3. Calculate total volume and bounding box from all meshes in the scene.
-        volume = 0.0
-        extents_raw = scene.extents if getattr(scene, "extents", None) is not None else [0, 0, 0]
-        extents = [float(x) for x in extents_raw]
+            # Generate a 2D mesh (surface mesh for GLB and volume)
+            gmsh.model.mesh.generate(2)
 
-        for geometry in scene.geometry.values():
-            if hasattr(geometry, "volume"):
-                volume += float(geometry.volume)
+            # Write to a temporary STL file because trimesh reads STL perfectly
+            gmsh.write(str(tmp_stl_path))
+        finally:
+            try:
+                gmsh.finalize()
+            except Exception:
+                pass
+
+        # Load the STL into trimesh
+        mesh = trimesh.load(str(tmp_stl_path), force="mesh")
+
+        # Calculate properties
+        volume = float(mesh.volume) if hasattr(mesh, "volume") else 0.0
+        extents = [float(x) for x in mesh.extents] if hasattr(mesh, "extents") else [0, 0, 0]
+
+        # Export to GLB
+        mesh.export(glb_path)
+
+        try:
+            if tmp_stl_path.exists():
+                tmp_stl_path.unlink()
+        except Exception:
+            pass
 
         return {
             "glb_url": f"/static/{glb_name}",
