@@ -2,6 +2,4 @@ fastapi
 uvicorn
 python-multipart
 trimesh
-numpy
-pythonocc-core
-
+cascadio==0.0.13

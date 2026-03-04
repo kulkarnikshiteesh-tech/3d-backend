@@ -55,58 +55,27 @@ async def upload_step(file: UploadFile = File(...)):
     glb_name = f"{uuid4()}.glb"
     glb_path = STATIC_DIR / glb_name
 
-    stl_path = tmp_step_path.with_suffix(".stl")
-
     try:
         with tmp_step_path.open("wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        # Geometry processing via pythonocc-core (STEP -> tessellated shape -> STL -> GLB)
-        from OCC.Core.Bnd import Bnd_Box
-        from OCC.Core.BRepGProp import brepgprop
-        from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
-        from OCC.Core.BRepBndLib import brepbndlib
-        from OCC.Core.GProp import GProp_GProps
-        from OCC.Core.IFSelect import IFSelect_RetDone
-        from OCC.Core.STEPControl import STEPControl_Reader
-        from OCC.Core.StlAPI import StlAPI_Writer
-
-        import numpy as np  # noqa: F401
+        import cascadio
         import trimesh
 
-        # 1. Read the STEP file
-        reader = STEPControl_Reader()
-        status = reader.ReadFile(str(tmp_step_path))
-        if status != IFSelect_RetDone:
-            raise RuntimeError("Failed to read STEP file")
-        reader.TransferRoots()
-        shape = reader.OneShape()
+        # Convert STEP to GLB using cascadio 0.0.13
+        glb_data = cascadio.step_to_glb(str(tmp_step_path))
+        with open(str(glb_path), "wb") as f:
+            f.write(glb_data)
 
-        # 2. Tessellate the shape into a mesh
-        mesh = BRepMesh_IncrementalMesh(shape, 0.1)
-        mesh.Perform()
-
-        # 3. Calculate volume
-        props = GProp_GProps()
-        brepgprop.VolumeProperties(shape, props)
-        volume = props.Mass()
-
-        # 4. Calculate bounding box
-        bbox = Bnd_Box()
-        brepbndlib.Add(shape, bbox)
-        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-        extents = [xmax - xmin, ymax - ymin, zmax - zmin]
-
-        # 5. Export to GLB using trimesh (via temporary STL)
-        writer = StlAPI_Writer()
-        writer.Write(shape, str(stl_path))
-        mesh_tri = trimesh.load(str(stl_path), force="mesh")
-        mesh_tri.export(str(glb_path))
+        # Load the GLB to calculate geometry
+        mesh = trimesh.load(str(glb_path), force="mesh")
+        volume = float(mesh.volume) if hasattr(mesh, "volume") else 0.0
+        extents = [float(x) for x in mesh.extents] if hasattr(mesh, "extents") else [0, 0, 0]
 
         return {
             "glb_url": f"/static/{glb_name}",
-            "volume_cubic_mm": float(volume),
-            "bounding_box_mm": {"x": float(extents[0]), "y": float(extents[1]), "z": float(extents[2])},
+            "volume_cubic_mm": volume,
+            "bounding_box_mm": {"x": extents[0], "y": extents[1], "z": extents[2]},
         }
     except HTTPException:
         raise
@@ -120,12 +89,6 @@ async def upload_step(file: UploadFile = File(...)):
     finally:
         try:
             await file.close()
-        except Exception:
-            pass
-
-        try:
-            if stl_path.exists():
-                stl_path.unlink()
         except Exception:
             pass
 
