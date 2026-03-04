@@ -45,11 +45,15 @@ async def health():
     return {"status": "ok"}
 
 
-def analyze_undercuts(mesh: trimesh.Trimesh) -> dict:
+def analyze_undercuts(mesh) -> dict:
     try:
+        # Handle Scene or multi-mesh objects
+        if isinstance(mesh, trimesh.scene.Scene):
+            mesh = trimesh.util.concatenate(list(mesh.dump()))
+        elif not isinstance(mesh, trimesh.Trimesh):
+            mesh = trimesh.util.concatenate(list(mesh.dump()))
+
         mesh.process(validate=True)
-        if not isinstance(mesh, trimesh.Trimesh):
-            mesh = mesh.dump(concatenate=True)
 
         pull_dir = np.array([0.0, 0.0, 1.0])
 
@@ -63,7 +67,6 @@ def analyze_undercuts(mesh: trimesh.Trimesh) -> dict:
             if np.dot(normal, pull_dir) > 0.3:
                 continue
             checked += 1
-
             origin = point + pull_dir * 0.1
             locations, _, _ = mesh.ray.intersects_location(
                 ray_origins=np.array([origin]),
@@ -96,6 +99,8 @@ def analyze_undercuts(mesh: trimesh.Trimesh) -> dict:
                 "undercut_message": "No undercut risk — part is fully compatible with straight-pull mold.",
             }
     except Exception as e:
+        print(f"Undercut analysis error: {type(e).__name__}: {str(e)}")
+        print(traceback.format_exc())
         return {
             "has_undercuts": None,
             "undercut_face_count": None,
@@ -165,3 +170,4 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
