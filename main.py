@@ -69,13 +69,24 @@ async def upload_step(file: UploadFile = File(...)):
 
         # Load the saved GLB into trimesh for geometry calculations
         mesh = trimesh.load(str(glb_path), force="mesh")
-        volume = float(mesh.volume) if hasattr(mesh, "volume") and mesh.volume else 0.0
-        extents = [float(x) for x in mesh.extents] if hasattr(mesh, "extents") else [0, 0, 0]
+        glb_url = f"/static/{glb_name}"
+
+        # Compute volume in cubic millimeters (trimesh volume is in cubic meters)
+        raw_volume_m3 = float(mesh.volume) if hasattr(mesh, "volume") and mesh.volume else 0.0
+        volume_cubic_mm = raw_volume_m3 * 1e9  # m^3 → mm^3
+
+        # Compute bounding box in millimeters
+        raw_extents_m = mesh.extents if hasattr(mesh, "extents") else [0.0, 0.0, 0.0]
+        bounding_box_mm = {
+            "x": float(raw_extents_m[0] * 1000.0),
+            "y": float(raw_extents_m[1] * 1000.0),
+            "z": float(raw_extents_m[2] * 1000.0),
+        }
 
         return {
-            "glb_url": f"/static/{glb_name}",
-            "volume_cubic_mm": volume,
-            "bounding_box_mm": {"x": extents[0], "y": extents[1], "z": extents[2]},
+            "glb_url": glb_url,  # example: '/static/xxxxx.glb'
+            "volume_cubic_mm": volume_cubic_mm,
+            "bounding_box_mm": bounding_box_mm,
         }
     except HTTPException:
         raise
