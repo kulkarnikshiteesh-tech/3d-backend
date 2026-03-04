@@ -48,10 +48,7 @@ async def health():
 
 def analyze_step_features(step_text: str) -> dict:
     """
-    Parse raw STEP file text to detect undercut-causing features:
-    - Cylindrical holes (CYLINDRICAL_SURFACE)
-    - Rectangular slots (PLANE entities that are internal)
-    - Toroidal surfaces (fillets inside pockets = undercut risk)
+    Parse raw STEP file text to detect undercut-causing features
     """
     try:
         # Count cylindrical surfaces — each is a potential hole/boss
@@ -67,30 +64,27 @@ def analyze_step_features(step_text: str) -> dict:
         n_conicals = len(conicals)
 
         # Extract cylinder radii to distinguish holes vs bosses
-        # CYLINDRICAL_SURFACE('',#axis,radius)
         radii = re.findall(
             r"CYLINDRICAL_SURFACE\s*\([^,]*,[^,]*,\s*([\d.]+)\s*\)",
             step_text,
             re.IGNORECASE,
         )
         radii_floats = [float(r) for r in radii]
-
-        # Holes tend to be smaller radius; bosses larger — heuristic threshold 15mm
         n_likely_holes = sum(1 for r in radii_floats if r < 15.0)
         n_likely_bosses = sum(1 for r in radii_floats if r >= 15.0)
 
         # Through-hole detection: cylinder referenced by EXACTLY 2 faces (sidewall only)
-cyl_ids = re.findall(
-    r"#(\d+)\s*=\s*CYLINDRICAL_SURFACE\s*\(",
-    step_text,
-    re.IGNORECASE,
-)
-through_hole_count = 0
-for cid in cyl_ids:
-    refs = re.findall(rf"ADVANCED_FACE\s*\([^)]*#{cid}[^)]*\)", step_text)
-    # EXACTLY 2 faces = through-hole (2 sidewalls). More = blind hole with bottom
-    if len(refs) == 2:
-        through_hole_count += 1
+        cyl_ids = re.findall(
+            r"#(\d+)\s*=\s*CYLINDRICAL_SURFACE\s*\(",
+            step_text,
+            re.IGNORECASE,
+        )
+        through_hole_count = 0
+        for cid in cyl_ids:
+            refs = re.findall(rf"ADVANCED_FACE\s*\([^)]*#{cid}[^)]*\)", step_text)
+            # EXACTLY 2 faces = through-hole (2 sidewalls). More = blind hole with bottom
+            if len(refs) == 2:
+                through_hole_count += 1
 
         has_undercut_features = (
             through_hole_count > 0 or n_conicals > 0
@@ -275,5 +269,6 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
 
 
