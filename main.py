@@ -171,7 +171,7 @@ def analyze_undercuts(mesh, step_features: dict) -> dict:
                     f"increasing tooling cost by ~25–40%."
                 ),
             }
-        elif ratio > 0.01:
+        elif ratio > 0.015:
             return {
                 "has_undercuts": True,
                 "undercut_face_count": int(np.sum(~reachable)),
@@ -269,6 +269,7 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
 
 
 
