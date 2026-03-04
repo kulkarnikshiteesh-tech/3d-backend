@@ -91,7 +91,7 @@ def analyze_undercuts(mesh: trimesh.Trimesh) -> dict:
                 "has_undercuts": False,
                 "undercut_face_count": 0,
                 "undercut_severity": "low",
-                "undercut_message": f"Low undercut risk — part is compatible with straight-pull mold.",
+                "undercut_message": f"No undercut risk — part is fully compatible with straight-pull mold.",
             }
     except Exception as e:
         return {
@@ -162,6 +162,7 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
 
 
 
