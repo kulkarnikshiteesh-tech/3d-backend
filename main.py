@@ -46,43 +46,55 @@ async def health():
 
 
 def analyze_undercuts(mesh: trimesh.Trimesh) -> dict:
-    """
-    Analyze undercuts by checking face normals against the pull direction (Z axis).
-    Faces with normals pointing significantly sideways (X or Y) are potential undercuts.
-    """
     try:
-        pull_axis = np.array([0, 0, 1])  # assume pull direction is Z
-        normals = mesh.face_normals  # shape: (N, 3)
+        # Sample points on the mesh surface
+        points, face_indices = trimesh.sample.sample_surface(mesh, 2000)
+        normals = mesh.face_normals[face_indices]
 
-        # Dot product of each face normal with pull axis
-        dot_z = np.abs(np.dot(normals, pull_axis))
+        pull_dir = np.array([0, 0, 1])  # pull from top
+        pull_dir_neg = np.array([0, 0, -1])
 
-        # Faces with low Z component = mostly sideways = potential undercut
-        # threshold: face normal is more than 60° away from pull axis
-        sideways_mask = dot_z < np.cos(np.radians(60))  # < 0.5
-        sideways_count = int(np.sum(sideways_mask))
-        total_faces = len(normals)
-        sideways_ratio = sideways_count / total_faces if total_faces > 0 else 0
+        undercut_count = 0
 
-        if sideways_ratio > 0.60:
-            severity = "high"
-            has_undercuts = True
-            message = f"High undercut risk — {sideways_count} faces ({sideways_ratio*100:.0f}%) face sideways. Side-action sliders likely required, increasing tooling cost by ~25–40%."
-        elif sideways_ratio > 0.40:
-            severity = "moderate"
-            has_undercuts = True
-            message = f"Moderate undercut risk — {sideways_count} faces ({sideways_ratio*100:.0f}%) face sideways. Review part for side holes or overhangs; sliders may be needed."
+        for i, (point, normal) in enumerate(zip(points, normals)):
+            # Only check faces that face sideways (not top/bottom)
+            dot = abs(np.dot(normal, pull_dir))
+            if dot > 0.3:  # skip faces that mostly face up or down
+                continue
+
+            # Shoot ray upward from this point
+            offset_point = point + pull_dir * 0.01
+            locs, _, _ = mesh.ray.intersects_location(
+                ray_origins=[offset_point],
+                ray_directions=[pull_dir]
+            )
+            if len(locs) > 0:
+                undercut_count += 1  # something blocks the exit = undercut
+
+        total_checked = sum(1 for n in normals if abs(np.dot(n, pull_dir)) <= 0.3)
+        ratio = undercut_count / total_checked if total_checked > 0 else 0
+
+        if ratio > 0.15:
+            return {
+                "has_undercuts": True,
+                "undercut_face_count": undercut_count,
+                "undercut_severity": "high",
+                "undercut_message": f"High undercut risk — {undercut_count} surface points are occluded from pull direction. Side-action sliders likely required, increasing tooling cost by ~25–40%.",
+            }
+        elif ratio > 0.05:
+            return {
+                "has_undercuts": True,
+                "undercut_face_count": undercut_count,
+                "undercut_severity": "moderate",
+                "undercut_message": f"Moderate undercut risk — {undercut_count} surface points may be occluded. Review part for side holes or overhangs.",
+            }
         else:
-            severity = "low"
-            has_undercuts = False
-            message = f"Low undercut risk — only {sideways_count} faces ({sideways_ratio*100:.0f}%) face sideways. Straight-pull mold likely sufficient."
-
-        return {
-            "has_undercuts": has_undercuts,
-            "undercut_face_count": sideways_count,
-            "undercut_severity": severity,
-            "undercut_message": message,
-        }
+            return {
+                "has_undercuts": False,
+                "undercut_face_count": undercut_count,
+                "undercut_severity": "low",
+                "undercut_message": f"Low undercut risk — part appears compatible with straight-pull mold.",
+            }
     except Exception as e:
         return {
             "has_undercuts": None,
@@ -153,4 +165,5 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
 
