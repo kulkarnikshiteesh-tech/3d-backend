@@ -47,58 +47,55 @@ async def health():
 
 def analyze_undercuts(mesh) -> dict:
     try:
-        # Handle Scene or multi-mesh objects
-        if isinstance(mesh, trimesh.scene.Scene):
-            mesh = trimesh.util.concatenate(list(mesh.dump()))
-        elif not isinstance(mesh, trimesh.Trimesh):
-            mesh = trimesh.util.concatenate(list(mesh.dump()))
+        if hasattr(mesh, 'dump'):
+            meshes = mesh.dump()
+            mesh = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
 
+        normals = np.array(mesh.face_normals)
+        areas = np.array(mesh.area_faces)
+        total_area = float(np.sum(areas))
 
-        pull_dir = np.array([0.0, 0.0, 1.0])
+        directions = [
+            np.array([0, 0, 1]),
+            np.array([0, 0, -1]),
+            np.array([1, 0, 0]),
+            np.array([-1, 0, 0]),
+            np.array([0, 1, 0]),
+            np.array([0, -1, 0]),
+        ]
 
-        points, face_indices = trimesh.sample.sample_surface(mesh, 1000)
-        normals = mesh.face_normals[face_indices]
+        reachable = np.zeros(len(normals), dtype=bool)
+        for d in directions:
+            dot = np.dot(normals, d)
+            reachable |= (dot > 0.15)
 
-        undercut_hits = 0
-        checked = 0
+        unreachable_area = float(np.sum(areas[~reachable]))
+        ratio = unreachable_area / total_area if total_area > 0 else 0
+        pct = ratio * 100
 
-        for point, normal in zip(points, normals):
-            if np.dot(normal, pull_dir) > 0.3:
-                continue
-            checked += 1
-            origin = point + pull_dir * 0.1
-            locations, _, _ = mesh.ray.intersects_location(
-                ray_origins=np.array([origin]),
-                ray_directions=np.array([pull_dir])
-            )
-            if len(locations) > 0:
-                undercut_hits += 1
-
-        ratio = undercut_hits / checked if checked > 0 else 0
-
-        if ratio > 0.25:
+        if ratio > 0.06:
             return {
                 "has_undercuts": True,
-                "undercut_face_count": undercut_hits,
+                "undercut_face_count": int(np.sum(~reachable)),
                 "undercut_severity": "high",
-                "undercut_message": f"High undercut risk — {undercut_hits} points blocked from pull direction. Side-action sliders likely required, increasing tooling cost by ~25–40%.",
+                "undercut_message": f"Undercut detected — {pct:.1f}% of surface area is not reachable from any pull direction. Side-action sliders required, increasing tooling cost by ~25–40%.",
             }
-        elif ratio > 0.10:
+        elif ratio > 0.02:
             return {
                 "has_undercuts": True,
-                "undercut_face_count": undercut_hits,
+                "undercut_face_count": int(np.sum(~reachable)),
                 "undercut_severity": "moderate",
-                "undercut_message": f"Moderate undercut risk — {undercut_hits} points may be occluded. Review part for side holes or overhangs.",
+                "undercut_message": f"Possible undercut — {pct:.1f}% of surface area may need sliders. Review side holes or internal features.",
             }
         else:
             return {
                 "has_undercuts": False,
-                "undercut_face_count": undercut_hits,
+                "undercut_face_count": 0,
                 "undercut_severity": "low",
-                "undercut_message": "No undercut risk — part is fully compatible with straight-pull mold.",
+                "undercut_message": f"No undercut risk — {pct:.1f}% unreachable area. Part is compatible with straight-pull mold.",
             }
     except Exception as e:
-        print(f"Undercut analysis error: {type(e).__name__}: {str(e)}")
+        print(f"Undercut error: {type(e).__name__}: {str(e)}")
         print(traceback.format_exc())
         return {
             "has_undercuts": None,
@@ -169,6 +166,7 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
 
 
 
