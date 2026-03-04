@@ -95,7 +95,7 @@ def analyze_step_features(step_text: str) -> dict:
                 through_hole_count += 1
 
         has_undercut_features = (
-            through_hole_count > 0 or n_toroids > 0 or n_conicals > 0
+            through_hole_count > 0 or n_conicals > 0
         )
 
         return {
@@ -277,3 +277,4 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
