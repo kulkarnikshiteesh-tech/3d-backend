@@ -64,11 +64,11 @@ def analyze_undercuts(mesh: trimesh.Trimesh) -> dict:
         total_faces = len(normals)
         sideways_ratio = sideways_count / total_faces if total_faces > 0 else 0
 
-        if sideways_ratio > 0.35:
+        if sideways_ratio > 0.60:
             severity = "high"
             has_undercuts = True
             message = f"High undercut risk — {sideways_count} faces ({sideways_ratio*100:.0f}%) face sideways. Side-action sliders likely required, increasing tooling cost by ~25–40%."
-        elif sideways_ratio > 0.15:
+        elif sideways_ratio > 0.40:
             severity = "moderate"
             has_undercuts = True
             message = f"Moderate undercut risk — {sideways_count} faces ({sideways_ratio*100:.0f}%) face sideways. Review part for side holes or overhangs; sliders may be needed."
@@ -153,3 +153,4 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
