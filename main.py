@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import tempfile
@@ -7,6 +8,8 @@ import traceback
 from pathlib import Path
 from uuid import uuid4
 
+import cascadio
+import trimesh
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -59,17 +62,16 @@ async def upload_step(file: UploadFile = File(...)):
         with tmp_step_path.open("wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        import cascadio
-        import trimesh
+        # Convert STEP to GLB bytes using cascadio 0.0.13
+        glb_bytes = cascadio.step_to_glb(str(tmp_step_path))
 
-        # Convert STEP to GLB using cascadio 0.0.13
-        glb_data = cascadio.step_to_glb(str(tmp_step_path))
+        # Save GLB to disk
         with open(str(glb_path), "wb") as f:
-            f.write(glb_data)
+            f.write(glb_bytes)
 
-        # Load the GLB to calculate geometry
-        mesh = trimesh.load(str(glb_path), force="mesh")
-        volume = float(mesh.volume) if hasattr(mesh, "volume") else 0.0
+        # Load GLB into trimesh for geometry calculations
+        mesh = trimesh.load(io.BytesIO(glb_bytes), file_type="glb", force="mesh")
+        volume = float(mesh.volume) if hasattr(mesh, "volume") and mesh.volume else 0.0
         extents = [float(x) for x in mesh.extents] if hasattr(mesh, "extents") else [0, 0, 0]
 
         return {
