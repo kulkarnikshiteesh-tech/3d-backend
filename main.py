@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import traceback
 import os
 import shutil
 import tempfile
+import traceback
 from pathlib import Path
-from typing import Any, Callable
 from uuid import uuid4
 
+import trimesh
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -37,97 +37,6 @@ async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": error_msg})
 
 
-def _call_with_fallbacks(func: Callable[..., Any], fallbacks: list[tuple[tuple[Any, ...], dict[str, Any]]]) -> None:
-    last_exc: BaseException | None = None
-    for args, kwargs in fallbacks:
-        try:
-            func(*args, **kwargs)
-            return
-        except TypeError as e:
-            last_exc = e
-            continue
-    if last_exc is not None:
-        raise last_exc
-
-
-def convert_step_to_glb(step_path: Path, glb_path: Path) -> None:
-    """
-    Convert a STEP file into GLB using cascadio.
-
-    cascadio's public API can vary between versions, so we try a few common call
-    shapes and raise a helpful error if none match.
-    """
-    try:
-        import cascadio  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError("Failed to import cascadio. Is it installed?") from e
-
-    convert = getattr(cascadio, "convert", None)
-    if callable(convert):
-        fallbacks: list[tuple[tuple[Any, ...], dict[str, Any]]] = [
-            ((str(step_path), str(glb_path)), {}),
-            ((step_path, glb_path), {}),
-            ((str(step_path),), {"output_path": str(glb_path)}),
-            ((str(step_path),), {"output_file": str(glb_path)}),
-            ((), {"input_path": str(step_path), "output_path": str(glb_path)}),
-            ((), {"input_file": str(step_path), "output_file": str(glb_path)}),
-        ]
-        _call_with_fallbacks(convert, fallbacks)
-        if not glb_path.exists():
-            raise RuntimeError("cascadio.convert did not produce an output .glb file")
-        return
-
-    # Some versions may expose a submodule/function like cascadio.converter.convert
-    for attr_chain in ("converter.convert", "conversion.convert", "io.convert"):
-        obj: Any = cascadio
-        ok = True
-        for part in attr_chain.split("."):
-            obj = getattr(obj, part, None)
-            if obj is None:
-                ok = False
-                break
-        if ok and callable(obj):
-            fallbacks = [
-                ((str(step_path), str(glb_path)), {}),
-                ((step_path, glb_path), {}),
-                ((), {"input_path": str(step_path), "output_path": str(glb_path)}),
-                ((), {"input_file": str(step_path), "output_file": str(glb_path)}),
-            ]
-            _call_with_fallbacks(obj, fallbacks)
-            if not glb_path.exists():
-                raise RuntimeError(f"{attr_chain} did not produce an output .glb file")
-            return
-
-    raise RuntimeError(
-        "Unsupported cascadio API: expected a callable convert function (e.g. cascadio.convert). "
-        "Please check your cascadio version's documentation."
-    )
-
-
-def load_glb_as_mesh(glb_path: Path):
-    try:
-        import trimesh  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError("Failed to import trimesh. Is it installed?") from e
-
-    loaded = trimesh.load(str(glb_path), force=None)
-
-    if isinstance(loaded, trimesh.Trimesh):
-        mesh = loaded
-    elif isinstance(loaded, trimesh.Scene):
-        if not loaded.geometry:
-            raise RuntimeError("Loaded GLB scene has no geometry")
-        geometries = list(loaded.geometry.values())
-        meshes = [g for g in geometries if isinstance(g, trimesh.Trimesh)]
-        if not meshes:
-            raise RuntimeError("Loaded GLB scene contains no mesh geometry")
-        mesh = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
-    else:
-        raise RuntimeError(f"Unsupported trimesh load type: {type(loaded)!r}")
-
-    return mesh
-
-
 @app.post("/upload")
 async def upload_step(file: UploadFile = File(...)):
     filename = file.filename or ""
@@ -146,13 +55,15 @@ async def upload_step(file: UploadFile = File(...)):
         with tmp_step_path.open("wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        convert_step_to_glb(tmp_step_path, glb_path)
+        # Load the STEP file directly with trimesh; cascadio is used under the hood.
+        mesh = trimesh.load(str(tmp_step_path), force="mesh")
 
-        mesh = load_glb_as_mesh(glb_path)
-
-        # Assumes the converted geometry is in millimeters.
+        # Assumes the geometry is in millimeters.
         extents = [float(x) for x in mesh.extents]
         volume = float(mesh.volume)
+
+        # Export the mesh to GLB in the static directory.
+        mesh.export(glb_path)
 
         return {
             "glb_url": f"/static/{glb_name}",
