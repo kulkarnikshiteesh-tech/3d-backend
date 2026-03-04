@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -12,7 +13,7 @@ from starlette.staticfiles import StaticFiles
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
-STATIC_DIR.mkdir(parents=True, exist_ok=True)
+os.makedirs(STATIC_DIR, exist_ok=True)
 
 app = FastAPI()
 
@@ -125,6 +126,9 @@ async def upload_step(file: UploadFile = File(...)):
     if suffix not in (".step", ".stp"):
         raise HTTPException(status_code=400, detail="Only .step/.stp files are supported")
 
+    # Ensure static directory exists before we attempt to write into it.
+    os.makedirs(STATIC_DIR, exist_ok=True)
+
     tmp_step_path = Path(tempfile.gettempdir()) / f"{uuid4()}{suffix}"
     glb_name = f"{uuid4()}.glb"
     glb_path = STATIC_DIR / glb_name
@@ -147,6 +151,7 @@ async def upload_step(file: UploadFile = File(...)):
             "bounding_box_mm": {"x": extents[0], "y": extents[1], "z": extents[2]},
         }
     except HTTPException:
+        # Re-raise known HTTP errors unchanged.
         raise
     except Exception as e:
         if glb_path.exists():
@@ -154,7 +159,15 @@ async def upload_step(file: UploadFile = File(...)):
                 glb_path.unlink()
             except Exception:
                 pass
-        raise HTTPException(status_code=500, detail=f"Upload/convert failed: {e}") from e
+        # Return the exact error information in the 500 response.
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Upload/convert failed",
+                "error": str(e),
+                "error_type": e.__class__.__name__,
+            },
+        ) from e
     finally:
         try:
             await file.close()
