@@ -53,7 +53,6 @@ def analyze_undercuts(mesh) -> dict:
         elif not isinstance(mesh, trimesh.Trimesh):
             mesh = trimesh.util.concatenate(list(mesh.dump()))
 
-        mesh.process(validate=True)
 
         pull_dir = np.array([0.0, 0.0, 1.0])
 
@@ -170,4 +169,5 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
 
