@@ -47,53 +47,51 @@ async def health():
 
 def analyze_undercuts(mesh: trimesh.Trimesh) -> dict:
     try:
-        # Sample points on the mesh surface
-        points, face_indices = trimesh.sample.sample_surface(mesh, 2000)
-        normals = mesh.face_normals[face_indices]
+        normals = mesh.face_normals
+        areas = mesh.area_faces
 
-        pull_dir = np.array([0, 0, 1])  # pull from top
-        pull_dir_neg = np.array([0, 0, -1])
+        pull_directions = [
+            np.array([0, 0, 1]),
+            np.array([0, 0, -1]),
+            np.array([1, 0, 0]),
+            np.array([-1, 0, 0]),
+            np.array([0, 1, 0]),
+            np.array([0, -1, 0]),
+        ]
 
-        undercut_count = 0
+        best_undercut_ratio = 1.0
 
-        for i, (point, normal) in enumerate(zip(points, normals)):
-            # Only check faces that face sideways (not top/bottom)
-            dot = abs(np.dot(normal, pull_dir))
-            if dot > 0.3:  # skip faces that mostly face up or down
-                continue
+        for pull in pull_directions:
+            # Faces facing away from pull direction = potential undercuts
+            dot = np.dot(normals, pull)
+            # A face is an undercut if it faces significantly OPPOSITE to pull
+            undercut_mask = dot < -0.3
+            undercut_area = float(np.sum(areas[undercut_mask]))
+            total_area = float(np.sum(areas))
+            ratio = undercut_area / total_area if total_area > 0 else 0
+            if ratio < best_undercut_ratio:
+                best_undercut_ratio = ratio
 
-            # Shoot ray upward from this point
-            offset_point = point + pull_dir * 0.01
-            locs, _, _ = mesh.ray.intersects_location(
-                ray_origins=[offset_point],
-                ray_directions=[pull_dir]
-            )
-            if len(locs) > 0:
-                undercut_count += 1  # something blocks the exit = undercut
-
-        total_checked = sum(1 for n in normals if abs(np.dot(n, pull_dir)) <= 0.3)
-        ratio = undercut_count / total_checked if total_checked > 0 else 0
-
-        if ratio > 0.15:
+        if best_undercut_ratio > 0.20:
             return {
                 "has_undercuts": True,
-                "undercut_face_count": undercut_count,
+                "undercut_face_count": int(np.sum(np.dot(normals, pull_directions[0]) < -0.3)),
                 "undercut_severity": "high",
-                "undercut_message": f"High undercut risk — {undercut_count} surface points are occluded from pull direction. Side-action sliders likely required, increasing tooling cost by ~25–40%.",
+                "undercut_message": f"High undercut risk — {best_undercut_ratio*100:.0f}% of surface area is occluded from best pull direction. Side-action sliders likely required, increasing tooling cost by ~25–40%.",
             }
-        elif ratio > 0.05:
+        elif best_undercut_ratio > 0.08:
             return {
                 "has_undercuts": True,
-                "undercut_face_count": undercut_count,
+                "undercut_face_count": int(np.sum(np.dot(normals, pull_directions[0]) < -0.3)),
                 "undercut_severity": "moderate",
-                "undercut_message": f"Moderate undercut risk — {undercut_count} surface points may be occluded. Review part for side holes or overhangs.",
+                "undercut_message": f"Moderate undercut risk — {best_undercut_ratio*100:.0f}% of surface area may be occluded. Review part for side holes or overhangs.",
             }
         else:
             return {
                 "has_undercuts": False,
-                "undercut_face_count": undercut_count,
+                "undercut_face_count": 0,
                 "undercut_severity": "low",
-                "undercut_message": f"Low undercut risk — part appears compatible with straight-pull mold.",
+                "undercut_message": f"Low undercut risk — part is compatible with straight-pull mold.",
             }
     except Exception as e:
         return {
@@ -102,7 +100,6 @@ def analyze_undercuts(mesh: trimesh.Trimesh) -> dict:
             "undercut_severity": "unknown",
             "undercut_message": "Undercut analysis could not be completed for this part.",
         }
-
 
 @app.post("/upload")
 async def upload_step(file: UploadFile = File(...)):
@@ -165,5 +162,6 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
 
 
