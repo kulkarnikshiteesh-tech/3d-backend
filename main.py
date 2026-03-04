@@ -56,7 +56,7 @@ def analyze_undercuts(mesh) -> dict:
 
         pull_dir = np.array([0.0, 0.0, 1.0])
 
-        points, face_indices = trimesh.sample.sample_surface_even(mesh, 1000)
+        points, face_indices = trimesh.sample.sample_surface(mesh, 1000)
         normals = mesh.face_normals[face_indices]
 
         undercut_hits = 0
@@ -169,5 +169,6 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
 
 
