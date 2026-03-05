@@ -45,20 +45,15 @@ async def health():
 
 def analyze_undercuts_geometric(mesh, pull_axis):
     """
-    Detects undercuts by analyzing face accessibility along a specific axis.
+    Detects undercuts by finding faces that point against the pull direction.
+    Ignores vertical walls (parallel to pull) to avoid false positives.
     """
     pull_vec = np.array(pull_axis) / np.linalg.norm(pull_axis)
-    
-    # Calculate dot product of normals vs pull direction
     dots = np.dot(mesh.face_normals, pull_vec)
     
-    # 1. Side Walls (Perpendicular to pull) -> Needs Side Action
-    perpendicular_faces = np.abs(dots) < 0.05
-    
-    # 2. Back-facing surfaces (Pointed against the pull) -> Trapped
-    back_faces = dots < -0.05
-    
-    undercut_mask = perpendicular_faces | back_faces
+    # We only flag faces that point 'down' (against the pull).
+    # A value of -0.1 means we ignore perfectly vertical walls (0.0).
+    undercut_mask = dots < -0.1
     undercut_indices = np.where(undercut_mask)[0]
     
     return {
@@ -68,24 +63,18 @@ def analyze_undercuts_geometric(mesh, pull_axis):
 
 def get_best_mold_analysis(mesh):
     """
-    Tests X, Y, and Z axes to find the orientation with the lowest manufacturing cost.
+    Checks X, Y, and Z axes and picks the one with the fewest undercuts.
     """
-    axes = {
-        "X-Axis": [1, 0, 0],
-        "Y-Axis": [0, 1, 0],
-        "Z-Axis": [0, 0, 1]
-    }
-    
+    axes = {"X-Axis": [1, 0, 0], "Y-Axis": [0, 1, 0], "Z-Axis": [0, 0, 1]}
     results = []
     for name, vector in axes.items():
         res = analyze_undercuts_geometric(mesh, vector)
         results.append({"axis": name, "data": res})
 
-    # Find the axis that minimizes the number of 'trapped' faces
     best = min(results, key=lambda x: x["data"]["count"])
     
-    # Threshold for detection (ignoring minor mesh noise)
-    has_undercuts = best["data"]["count"] > 25 
+    # Only flag as undercut if a significant number of faces are trapped.
+    has_undercuts = best["data"]["count"] > 20 
     
     return {
         "has_undercuts": has_undercuts,
@@ -93,8 +82,7 @@ def get_best_mold_analysis(mesh):
         "undercut_severity": "high" if has_undercuts else "low",
         "optimal_axis": best["axis"],
         "undercut_message": (
-            f"Undercut detected. Optimal mold pull is the {best['axis']}. "
-            "Side-action sliders or lifters will be required."
+            f"Undercut detected. Optimal mold pull is the {best['axis']}. Side-actions required."
             if has_undercuts else "No significant undercut risk. Part is straight-pull compatible."
         )
     }
@@ -119,21 +107,24 @@ async def upload_step(file: UploadFile = File(...)):
         if conv_res != 0:
             raise RuntimeError(f"cascadio conversion failed: {conv_res}")
 
-        # 2. Load Mesh & Handle Scene (Multi-body files)
+        # 2. Load Mesh
         loaded = trimesh.load(str(glb_path), force="mesh")
         if isinstance(loaded, trimesh.Scene):
-            if not loaded.geometry:
-                raise ValueError("The STEP file contains no valid geometry.")
             mesh = trimesh.util.concatenate([g for g in loaded.geometry.values()])
         else:
             mesh = loaded
 
-        # 3. Geometric Undercut Analysis
+        # 3. Fix Volume Calculation (Ignore 'watertight' errors)
+        try:
+            # We use absolute value to ensure positive volume
+            volume_mm3 = abs(float(mesh.volume)) * 1e9
+        except:
+            volume_mm3 = 0.0
+
+        # 4. Analyze Undercuts
         undercut_data = get_best_mold_analysis(mesh)
 
-        # 4. Physical Calculations
-        # Convert volume to cubic mm (trimesh defaults to meters for STEP-to-GLB)
-        volume_mm3 = (float(mesh.volume) if mesh.is_watertight else 0.0) * 1e9
+        # 5. Dimensions
         extents = (mesh.extents * 1000.0)
         
         return {
