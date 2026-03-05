@@ -44,17 +44,14 @@ async def health():
 
 def calculate_mold_cost(volume_mm3, has_undercuts, undercut_count):
     """
-    Refined Cost Logic:
-    - Base price covers setup and CNC time.
-    - Volume adds material/size complexity.
-    - Undercuts add 'Side Action' costs (approx. $1,800 per slider).
+    Cost Engine: Calculates base tooling + size complexity + slider penalties.
     """
     base_cost = 2500.0 
     size_factor = (volume_mm3 / 1000) * 0.05 
     
     undercut_penalty = 0.0
     if has_undercuts:
-        # Every ~150 faces suggests a distinct side-action requirement
+        # Every ~150 faces suggests a distinct side-action requirement (slider/lifter)
         num_sliders = max(1, undercut_count // 150)
         undercut_penalty = num_sliders * 1800.0 
 
@@ -63,14 +60,16 @@ def calculate_mold_cost(volume_mm3, has_undercuts, undercut_count):
 
 def analyze_undercuts_geometric(mesh, pull_axis):
     """
-    Strict Geometric Filter: Ignores vertical walls and flat floors.
-    Only flags faces angled against the pull that would be 'trapped'.
+    Strict Geometric Filter:
+    - Ignores vertical walls (parallel to pull).
+    - Ignores flat floors (perpendicular to pull but not trapped).
+    - Flags overhangs that would physically trap a mold plate.
     """
     pull_vec = np.array(pull_axis) / np.linalg.norm(pull_axis)
     dots = np.dot(mesh.face_normals, pull_vec)
     
-    # Filter: Ignore vertical walls (dots near 0.0) and flat floors (dots near -1.0)
-    # This specifically fixes the false positives seen in hole bottoms.
+    # Thresholds: Ignore near-vertical (dots ~0) and near-flat (dots ~ -1.0)
+    # This specifically removes false positives from Z-axis holes and pockets.
     undercut_mask = (dots < -0.15) & (dots > -0.98)
     undercut_indices = np.where(undercut_mask)[0]
     
@@ -82,7 +81,7 @@ def analyze_undercuts_geometric(mesh, pull_axis):
 def get_best_mold_analysis(mesh):
     """
     ORIENTATION INDEPENDENT LOGIC:
-    Tests X, Y, and Z axes to find the pull direction with the fewest undercuts.
+    Independent test of X, Y, and Z to find the pull direction with the fewest constraints.
     """
     axes = {"X-Axis": [1, 0, 0], "Y-Axis": [0, 1, 0], "Z-Axis": [0, 0, 1]}
     results = []
@@ -91,10 +90,10 @@ def get_best_mold_analysis(mesh):
         res = analyze_undercuts_geometric(mesh, vector)
         results.append({"axis": name, "data": res})
 
-    # Find the axis that minimizes 'trapped' geometry
+    # Select the axis that minimizes 'trapped' geometry
     best = min(results, key=lambda x: x["data"]["count"])
     
-    # Threshold to ignore minor mesh noise (80 faces)
+    # Buffer to ignore minor mesh artifacts (80 faces) common in low-res conversions
     has_undercuts = best["data"]["count"] > 80 
     
     return {
@@ -128,7 +127,7 @@ async def upload_step(file: UploadFile = File(...)):
         if conv_res != 0:
             raise RuntimeError(f"cascadio failed: {conv_res}")
 
-        # 2. Load Mesh & Merge Scene Bodies
+        # 2. Load Mesh & Merge multi-body STEP files
         loaded = trimesh.load(str(glb_path), force="mesh")
         if isinstance(loaded, trimesh.Scene):
             mesh = trimesh.util.concatenate([g for g in loaded.geometry.values()])
@@ -136,12 +135,13 @@ async def upload_step(file: UploadFile = File(...)):
             mesh = loaded
 
         # 3. Robust Volume Calculation (mm3)
+        # Using abs() ensures valid output even if normals are inverted.
         volume_mm3 = abs(float(mesh.volume)) * 1e9
 
-        # 4. Analyze Undercuts & Best Orientation
+        # 4. Independent Axis Analysis
         undercut_data = get_best_mold_analysis(mesh)
 
-        # 5. Refined Cost Estimation
+        # 5. Dynamic Cost Estimation
         estimated_mold_cost_usd = calculate_mold_cost(
             volume_mm3, 
             undercut_data["has_undercuts"], 
