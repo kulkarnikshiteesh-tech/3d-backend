@@ -5,3 +5,4 @@ trimesh
 numpy
 cascadio==0.0.13
 scipy
+rtree
