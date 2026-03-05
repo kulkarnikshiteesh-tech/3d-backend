@@ -14,92 +14,92 @@ os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 def calculate_mold_cost_inr(volume_mm3, has_undercuts):
-    # Base for Zinc Alloy / Soft Mold in India as per your UI
-    base_cost = 25000.0 
+    # Baseline soft-tooling cost in India
+    base_cost = 28000.0 
     volume_cm3 = volume_mm3 / 1000.0
-    size_factor = volume_cm3 * 0.06 
+    size_factor = volume_cm3 * 0.05 
     
-    # Penalty only if a REAL physical undercut is detected
+    # Significant penalty for side-actions (sliders/lifters)
     undercut_penalty = 45000.0 if has_undercuts else 0.0
     return round(base_cost + size_factor + undercut_penalty, 2)
 
-def get_sureshot_undercut_analysis(mesh):
+def analyze_axis_for_trapped_faces(mesh, axis_vector):
     """
-    Ray-Tracing Analysis: Checks if geometry is physically blocked.
+    Checks if geometry is 'trapped' along a specific vector.
     """
-    pull_dir = np.array([0, 0, 1])
-    dots = np.dot(mesh.face_normals, pull_dir)
-    potential_faces = np.where(dots < -0.1)[0]
+    pull_dir = np.array(axis_vector) / np.linalg.norm(axis_vector)
     
-    if len(potential_faces) == 0:
-        return False, 0
+    # Identify vertical walls relative to this axis
+    dots = np.abs(np.dot(mesh.face_normals, pull_dir))
+    side_indices = np.where(dots < 0.1)[0]
+    
+    if len(side_indices) == 0:
+        return 0
 
-    # Ensure origins are offset to prevent self-collision
-    origins = mesh.triangles_center[potential_faces] + (mesh.face_normals[potential_faces] * 0.001)
+    origins = mesh.triangles_center[side_indices]
     
+    # Sandwich check: Look 'Forward' and 'Backward' along the axis
     try:
-        # Physical check: Does anything block the path upward?
-        hits = mesh.ray.intersects_any(
-            origins=origins, 
-            ray_directions=np.tile(pull_dir, (len(origins), 1))
-        )
-        true_undercut_count = int(np.sum(hits))
-    except Exception as ray_err:
-        print(f"Ray-tracing fallback: {ray_err}")
-        true_undercut_count = 0 # Safety fallback
+        hits_forward = mesh.ray.intersects_any(origins + (pull_dir * 0.1), np.tile(pull_dir, (len(origins), 1)))
+        hits_backward = mesh.ray.intersects_any(origins - (pull_dir * 0.1), np.tile(-pull_dir, (len(origins), 1)))
+        # A face is an undercut if it has plastic on both sides along the pull axis
+        return int(np.sum(np.logical_and(hits_forward, hits_backward)))
+    except:
+        return 9999 # Fallback if ray-tracing fails
 
-    # 100 face threshold to ignore mesh conversion noise
-    has_real_undercuts = true_undercut_count > 100
-    return has_real_undercuts, true_undercut_count
+def get_best_orientation_analysis(mesh):
+    """
+    Evaluates X, Y, and Z axes to find the most efficient molding direction.
+    """
+    axes = {"X-Axis": [1, 0, 0], "Y-Axis": [0, 1, 0], "Z-Axis": [0, 0, 1]}
+    results = {name: analyze_axis_for_trapped_faces(mesh, vec) for name, vec in axes.items()}
+    
+    # Find the axis with the least amount of trapped geometry
+    optimal_axis = min(results, key=results.get)
+    undercut_count = results[optimal_axis]
+    
+    # Threshold (40 faces) ignores minor mesh artifacts
+    has_undercuts = undercut_count > 40
+    
+    return has_undercuts, undercut_count, optimal_axis
 
 @app.post("/upload")
 async def upload_step(file: UploadFile = File(...)):
     tmp_step = Path(tempfile.gettempdir()) / f"{uuid4()}.step"
     glb_path = STATIC_DIR / f"{uuid4()}.glb"
     try:
-        with tmp_step.open("wb") as f: 
-            shutil.copyfileobj(file.file, f)
-            
-        # 1. STEP to GLB
+        with tmp_step.open("wb") as f: shutil.copyfileobj(file.file, f)
         cascadio.step_to_glb(str(tmp_step), str(glb_path))
         
-        # 2. Load Mesh
         scene = trimesh.load(str(glb_path))
-        if isinstance(scene, trimesh.Scene):
-            mesh = trimesh.util.concatenate([g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)])
-        else:
-            mesh = scene
+        mesh = trimesh.util.concatenate([g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)])
 
-        # 3. VOLUME FIX: Shell Estimation for Enclosures
+        # Volume Logic: Use Shell-estimate if mesh isn't watertight
         bbox_vol = np.prod(mesh.extents) * 1e9
         measured_vol = abs(mesh.volume) * 1e9
-        
-        # If it's over 50% of bbox, it's counting air. Use Surface Area * 1.5mm wall.
         if measured_vol > (bbox_vol * 0.5):
             volume_mm3 = (mesh.area * 1e6 / 2.0) * 1.5 
         else:
             volume_mm3 = measured_vol
 
-        # 4. UNDERCUT ANALYSIS
-        has_undercut, u_count = get_sureshot_undercut_analysis(mesh)
+        # Run Auto-Orientation Undercut Analysis
+        has_undercut, u_count, best_axis = get_best_orientation_analysis(mesh)
         
-        # 5. COSTING
-        total_mold_cost = calculate_mold_cost_inr(volume_mm3, has_undercut)
-        per_piece_cost = round((volume_mm3 / 69311.0) * 18.29, 2)
+        mold_cost = calculate_mold_cost_inr(volume_mm3, has_undercut)
+        per_piece = round((volume_mm3 / 69311.0) * 18.29, 2)
 
         return {
             "glb_url": f"/static/{glb_path.name}",
             "volume_cubic_mm": volume_mm3,
-            "estimated_mold_cost_inr": total_mold_cost,
-            "estimated_per_piece_inr": per_piece_cost,
-            "bounding_box_mm": {"x": mesh.extents[0]*1000, "y": mesh.extents[1]*1000, "z": mesh.extents[2]*1000},
+            "estimated_mold_cost_inr": mold_cost,
+            "estimated_per_piece_inr": per_piece,
             "has_undercuts": has_undercut,
             "undercut_face_count": u_count,
-            "optimal_axis": "Z-Axis",
-            "undercut_message": "Straight-pull compatible" if not has_undercut else "Side-action sliders required"
+            "optimal_axis": best_axis,
+            "undercut_message": f"Optimal Pull: {best_axis}. " + ("Side-actions required." if has_undercut else "Straight-pull compatible.")
         }
     except Exception as e:
-        print("UPLOAD ERROR:", traceback.format_exc())
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if tmp_step.exists(): tmp_step.unlink()
