@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import os
-import re
 import shutil
 import tempfile
 import traceback
@@ -43,17 +42,36 @@ async def global_exception_handler(request: Request, exc: Exception):
 async def health():
     return {"status": "ok"}
 
+def calculate_mold_cost(volume_mm3, has_undercuts, undercut_count):
+    """
+    Refined Cost Logic:
+    - Base price covers setup and CNC time.
+    - Volume adds material/size complexity.
+    - Undercuts add 'Side Action' costs (approx. $1,500 - $2,500 per slider).
+    """
+    base_cost = 2500.0  # Base tooling setup
+    size_factor = (volume_mm3 / 1000) * 0.05  # Scale by cm3
+    
+    undercut_penalty = 0.0
+    if has_undercuts:
+        # Every ~100 undercut faces suggest a needed slider or lifter
+        num_sliders = max(1, undercut_count // 100)
+        undercut_penalty = num_sliders * 1800.0 
+
+    total_usd = base_cost + size_factor + undercut_penalty
+    return round(total_usd, 2)
+
 def analyze_undercuts_geometric(mesh, pull_axis):
     """
-    Detects undercuts by finding faces that point against the pull direction.
-    Ignores vertical walls (parallel to pull) to avoid false positives.
+    Refined detection: Ignore flat pocket floors and vertical walls.
+    Only flag faces that are truly 'hidden' or steeply angled against the pull.
     """
     pull_vec = np.array(pull_axis) / np.linalg.norm(pull_axis)
     dots = np.dot(mesh.face_normals, pull_vec)
     
-    # We only flag faces that point 'down' (against the pull).
-    # A value of -0.1 means we ignore perfectly vertical walls (0.0).
-    undercut_mask = dots < -0.1
+    # 1. Ignore vertical walls (dots near 0) and flat floors (dots near -1.0).
+    # 2. Flag 'Overhangs' where the face is angled sharply away (between -0.1 and -0.99).
+    undercut_mask = (dots < -0.1) & (dots > -0.99)
     undercut_indices = np.where(undercut_mask)[0]
     
     return {
@@ -63,7 +81,7 @@ def analyze_undercuts_geometric(mesh, pull_axis):
 
 def get_best_mold_analysis(mesh):
     """
-    Checks X, Y, and Z axes and picks the one with the fewest undercuts.
+    Tests X, Y, and Z axes to find the most cost-effective mold orientation.
     """
     axes = {"X-Axis": [1, 0, 0], "Y-Axis": [0, 1, 0], "Z-Axis": [0, 0, 1]}
     results = []
@@ -73,17 +91,17 @@ def get_best_mold_analysis(mesh):
 
     best = min(results, key=lambda x: x["data"]["count"])
     
-    # Only flag as undercut if a significant number of faces are trapped.
-    has_undercuts = best["data"]["count"] > 20 
+    # Threshold: Ignore minor mesh noise (under 60 faces is usually fine).
+    has_undercuts = best["data"]["count"] > 60 
     
     return {
         "has_undercuts": has_undercuts,
         "undercut_face_count": int(best["data"]["count"]),
-        "undercut_severity": "high" if has_undercuts else "low",
+        "undercut_severity": "high" if best["data"]["count"] > 250 else "low",
         "optimal_axis": best["axis"],
         "undercut_message": (
-            f"Undercut detected. Optimal mold pull is the {best['axis']}. Side-actions required."
-            if has_undercuts else "No significant undercut risk. Part is straight-pull compatible."
+            f"Undercut detected. Optimal pull is {best['axis']}. Side-actions required."
+            if has_undercuts else f"Straight-pull compatible mold (Optimal Axis: {best['axis']})."
         )
     }
 
@@ -107,30 +125,37 @@ async def upload_step(file: UploadFile = File(...)):
         if conv_res != 0:
             raise RuntimeError(f"cascadio conversion failed: {conv_res}")
 
-        # 2. Load Mesh
+        # 2. Load Mesh & Handle Multi-body Scenes
         loaded = trimesh.load(str(glb_path), force="mesh")
         if isinstance(loaded, trimesh.Scene):
             mesh = trimesh.util.concatenate([g for g in loaded.geometry.values()])
         else:
             mesh = loaded
 
-        # 3. Fix Volume Calculation (Ignore 'watertight' errors)
+        # 3. Robust Volume Calculation (mm3)
         try:
-            # We use absolute value to ensure positive volume
             volume_mm3 = abs(float(mesh.volume)) * 1e9
         except:
             volume_mm3 = 0.0
 
-        # 4. Analyze Undercuts
+        # 4. Analyze Undercuts and Orientation
         undercut_data = get_best_mold_analysis(mesh)
 
-        # 5. Dimensions
+        # 5. Dynamic Cost Calculation
+        estimated_mold_cost_usd = calculate_mold_cost(
+            volume_mm3, 
+            undercut_data["has_undercuts"], 
+            undercut_data["undercut_face_count"]
+        )
+
+        # 6. Bounding Box Dimensions (mm)
         extents = (mesh.extents * 1000.0)
         
         return {
             "glb_url": f"/static/{glb_name}",
             "volume_cubic_mm": volume_mm3,
             "bounding_box_mm": {"x": extents[0], "y": extents[1], "z": extents[2]},
+            "estimated_mold_cost_usd": estimated_mold_cost_usd,
             **undercut_data,
         }
 
