@@ -105,54 +105,71 @@ def analyze_step_features(step_text: str) -> dict:
         return {"step_has_undercut_features": False}
 
 
-def analyze_undercuts(mesh, step_features: dict) -> dict:
+def analyze_undercuts_geometric(mesh, pull_axis):
     """
-    Use STEP feature parsing only.
-    Mesh-based area ratios are ignored to avoid false positives.
+    Detects if faces are perpendicular to the pull direction or 
+    occluded (trapped) from both the top and bottom.
     """
-    try:
-        has_features = step_features.get("step_has_undercut_features", False)
-        through_holes = int(step_features.get("step_through_holes", 0) or 0)
-        conicals = int(step_features.get("step_conicals", 0) or 0)
+    pull_vec = np.array(pull_axis)
+    
+    # 1. Find faces perpendicular to the pull (e.g., side holes)
+    # Dot product of ~0 means the face points sideways relative to the mold opening.
+    dots = np.dot(mesh.face_normals, pull_vec)
+    perpendicular_mask = np.abs(dots) < 0.05
+    
+    # 2. Ray-casting Shadow Test
+    # Fire rays in the + and - directions of the pull axis.
+    # If a face is blocked in BOTH directions, it's an undercut.
+    _, _, index_tri_up = mesh.ray.intersects_id(
+        ray_origins=mesh.triangles_center,
+        ray_directions=np.tile(pull_vec, (len(mesh.faces), 1)),
+        multiple_hits=False
+    )
+    _, _, index_tri_dw = mesh.ray.intersects_id(
+        ray_origins=mesh.triangles_center,
+        ray_directions=np.tile(-pull_vec, (len(mesh.faces), 1)),
+        multiple_hits=False
+    )
 
-        if has_features:
-            details = []
-            if through_holes > 0:
-                details.append(f"{through_holes} through-hole(s)")
-            if conicals > 0:
-                details.append(f"{conicals} conical feature(s)")
-            feature_str = ", ".join(details) if details else "undercut features"
+    blocked_up = set(index_tri_up)
+    blocked_dw = set(index_tri_dw)
+    trapped_faces = blocked_up.intersection(blocked_dw)
+    
+    # Combine both types of undercuts
+    undercut_indices = set(np.where(perpendicular_mask)[0]).union(trapped_faces)
+    
+    return {
+        "count": len(undercut_indices),
+        "area": mesh.area_faces[list(undercut_indices)].sum() if undercut_indices else 0
+    }
+def get_best_mold_analysis(mesh):
+    axes = {
+        "X-Axis": [1, 0, 0],
+        "Y-Axis": [0, 1, 0],
+        "Z-Axis": [0, 0, 1]
+    }
+    
+    results = []
+    for name, vector in axes.items():
+        res = analyze_undercuts_geometric(mesh, vector)
+        results.append({"axis": name, "data": res})
 
-            return {
-                "has_undercuts": True,
-                "undercut_face_count": None,
-                "undercut_severity": "high",
-                "undercut_message": (
-                    f"Undercut detected — {feature_str} found in STEP geometry. "
-                    "Side-action sliders or lifters required, increasing tooling cost by ~25–40%."
-                ),
-            }
-
-        # No undercut features in STEP → treat as straight‑pull
-        return {
-            "has_undercuts": False,
-            "undercut_face_count": 0,
-            "undercut_severity": "low",
-            "undercut_message": (
-                "No undercut risk detected from STEP geometry. "
-                "Part is compatible with a straight‑pull mold."
-            ),
-        }
-
-    except Exception as e:
-        print(f"Undercut error: {type(e).__name__}: {str(e)}")
-        return {
-            "has_undercuts": None,
-            "undercut_face_count": None,
-            "undercut_severity": "unknown",
-            "undercut_message": "Undercut analysis could not be completed for this part.",
-        }
-
+    # Pick the axis with the lowest number of undercut faces
+    best = min(results, key=lambda x: x["data"]["count"])
+    
+    # If the 'best' axis still has many undercut faces, it truly needs side-actions.
+    has_undercuts = best["data"]["count"] > 15 
+    
+    return {
+        "has_undercuts": has_undercuts,
+        "undercut_face_count": best["data"]["count"],
+        "undercut_severity": "high" if has_undercuts else "low",
+        "optimal_axis": best["axis"],
+        "undercut_message": (
+            f"Detected {best['data']['count']} undercut faces. Side-actions required."
+            if has_undercuts else "Straight-pull compatible."
+        )
+    }
 @app.post("/upload")
 async def upload_step(file: UploadFile = File(...)):
     filename = file.filename or ""
@@ -162,63 +179,64 @@ async def upload_step(file: UploadFile = File(...)):
 
     os.makedirs("static", exist_ok=True)
 
+    # Create temporary paths for processing
     tmp_step_path = Path(tempfile.gettempdir()) / f"{uuid4()}{suffix}"
     glb_name = f"{uuid4()}.glb"
     glb_path = STATIC_DIR / glb_name
 
     try:
+        # Save the uploaded file to disk
         with tmp_step_path.open("wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        # Parse STEP text BEFORE conversion
-        step_text = tmp_step_path.read_text(errors="ignore")
-        step_features = analyze_step_features(step_text)
-        print(f"STEP features detected: {step_features}")
-
+        # 1. Convert STEP to GLB for 3D viewing and analysis
         result = cascadio.step_to_glb(str(tmp_step_path), str(glb_path))
         if result != 0:
             raise RuntimeError(f"cascadio conversion failed with code {result}")
 
+        # 2. Load the mesh using trimesh
         mesh = trimesh.load(str(glb_path), force="mesh")
-        glb_url = f"/static/{glb_name}"
+        
+        # 3. Run the Smart Geometric Analysis (Tests X, Y, and Z axes)
+        # Note: Ensure the 'get_best_mold_analysis' function is defined above this route
+        undercut_data = get_best_mold_analysis(mesh)
 
-        raw_volume_m3 = float(mesh.volume) if hasattr(mesh, "volume") and mesh.volume else 0.0
-        volume_cubic_mm = raw_volume_m3 * 1e9
-
-        raw_extents_m = mesh.extents if hasattr(mesh, "extents") else [0.0, 0.0, 0.0]
+        # 4. Calculate physical properties
+        # Trimesh volume is in meters cubed, converting to cubic mm
+        volume_mm3 = (float(mesh.volume) if hasattr(mesh, "volume") and mesh.volume else 0.0) * 1e9
+        
+        # Get bounding box extents in mm
+        raw_extents = mesh.extents if hasattr(mesh, "extents") else [0.0, 0.0, 0.0]
         bounding_box_mm = {
-            "x": float(raw_extents_m[0] * 1000.0),
-            "y": float(raw_extents_m[1] * 1000.0),
-            "z": float(raw_extents_m[2] * 1000.0),
+            "x": float(raw_extents[0] * 1000.0),
+            "y": float(raw_extents[1] * 1000.0),
+            "z": float(raw_extents[2] * 1000.0),
         }
-
-        undercut_data = analyze_undercuts(mesh, step_features)
 
         return {
-            "glb_url": glb_url,
-            "volume_cubic_mm": volume_cubic_mm,
+            "glb_url": f"/static/{glb_name}",
+            "volume_cubic_mm": volume_mm3,
             "bounding_box_mm": bounding_box_mm,
-            **undercut_data,
+            **undercut_data,  # This includes has_undercuts, severity, and optimal_axis
         }
-    except HTTPException:
-        raise
-    except Exception:
+
+    except Exception as e:
+        print(f"Upload Error: {traceback.format_exc()}")
         if glb_path.exists():
             try:
                 glb_path.unlink()
-            except Exception:
+            except:
                 pass
-        raise
+        raise HTTPException(status_code=500, detail=str(e))
+    
     finally:
+        # Cleanup the temporary STEP file
         try:
             await file.close()
-        except Exception:
-            pass
-        if tmp_step_path.exists():
-            try:
+            if tmp_step_path.exists():
                 tmp_step_path.unlink()
-            except Exception:
-                pass
+        except:
+            pass
 
 
 
