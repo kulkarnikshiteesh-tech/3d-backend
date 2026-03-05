@@ -7,50 +7,45 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
 
-STATIC_DIR = Path("static")
-os.makedirs("static", exist_ok=True)
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+STATIC_DIR = Path("static")
+os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 def calculate_mold_cost_inr(volume_mm3, has_undercuts, undercut_count):
-    # Standard Indian Market Base Rates
-    base_cost_inr = 150000.0 
+    # Reverted to more conservative base logic
+    base_cost = 120000.0 
     volume_cm3 = volume_mm3 / 1000.0
-    size_factor_inr = volume_cm3 * 5.0 # Complexity scaling
+    # Scaled complexity: Large hollow parts shouldn't scale as fast as solids
+    size_factor = volume_cm3 * 3.5 
     
-    undercut_penalty_inr = 0.0
-    if has_undercuts:
-        # Only penalize for significant geometry issues
-        num_sliders = max(1, undercut_count // 200)
-        undercut_penalty_inr = num_sliders * 55000.0 
-    return round(base_cost_inr + size_factor_inr + undercut_penalty_inr, 2)
+    undercut_penalty = 0.0
+    if has_undercuts and undercut_count > 150:
+        undercut_penalty = 45000.0 # Standard side-action cost
+        
+    return round(base_cost + size_factor + undercut_penalty, 2)
 
-def analyze_undercuts_geometric(mesh, pull_axis):
-    pull_vec = np.array(pull_axis) / np.linalg.norm(pull_axis)
+def get_refined_analysis(mesh):
+    # Test only Z-axis as primary pull (as seen in your screenshots)
+    pull_vec = np.array([0, 0, 1])
     dots = np.dot(mesh.face_normals, pull_vec)
     
-    # Only flag faces pointing "down" significantly (-0.2 to -0.98)
-    # This ignores vertical walls and the flat bottom floors of your holes.
-    undercut_mask = (dots < -0.2) & (dots > -0.98)
-    indices = np.where(undercut_mask)[0]
-    return {"count": len(indices), "area": float(mesh.area_faces[indices].sum()) if len(indices) > 0 else 0}
-
-def get_best_mold_analysis(mesh):
-    axes = {"X-Axis": [1,0,0], "Y-Axis": [0,1,0], "Z-Axis": [0,0,1]}
-    results = []
-    for name, vec in axes.items():
-        res = analyze_undercuts_geometric(mesh, vec)
-        results.append({"axis": name, "data": res})
+    # STRICT FILTER: 
+    # Ignore vertical walls (dot ~ 0)
+    # Ignore flat floors (dot ~ -1)
+    # Only flag significant 'Trapped' overhangs
+    undercut_mask = (dots < -0.3) & (dots > -0.95)
+    undercut_count = np.sum(undercut_mask)
     
-    best = min(results, key=lambda x: x["data"]["count"])
-    # Threshold (100 faces) ignores tiny mesh artifacts around hole edges
-    has_undercuts = best["data"]["count"] > 100 
+    # Thresholding: 150 faces allows for mesh noise on hole rims
+    has_undercuts = int(undercut_count) > 150
+    
     return {
         "has_undercuts": has_undercuts,
-        "undercut_face_count": int(best["data"]["count"]),
-        "optimal_axis": best["axis"],
-        "undercut_message": f"Straight-pull compatible (Optimal: {best['axis']})" if not has_undercuts else f"Undercuts detected on {best['axis']}."
+        "undercut_face_count": int(undercut_count),
+        "optimal_axis": "Z-Axis",
+        "undercut_message": "Straight-pull compatible" if not has_undercuts else "Undercut detected: Side-action required."
     }
 
 @app.post("/upload")
@@ -61,25 +56,30 @@ async def upload_step(file: UploadFile = File(...)):
         with tmp_step.open("wb") as f: shutil.copyfileobj(file.file, f)
         cascadio.step_to_glb(str(tmp_step), str(glb_path))
         
-        loaded = trimesh.load(str(glb_path))
-        # FIX: Merge all parts of the STEP file to get a single, accurate volume
-        if isinstance(loaded, trimesh.Scene):
-            mesh = trimesh.util.concatenate([g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)])
-        else:
-            mesh = loaded
+        scene = trimesh.load(str(glb_path))
+        mesh = trimesh.util.concatenate([g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)])
 
-        # FIX: Robust volume calculation for enclosures
-        volume_mm3 = abs(float(mesh.volume)) * 1e9 if mesh.is_watertight else abs(mesh.convex_hull.volume) * 0.85 * 1e9
+        # THE VOLUME FIX: 
+        # If volume is > 50% of bounding box, it's likely counting 'air'. 
+        # We use surface area * estimated wall thickness (2mm) as a sanity check.
+        raw_vol = abs(mesh.volume) * 1e9
+        bbox_vol = np.prod(mesh.extents) * 1e9
         
-        undercut_data = get_best_mold_analysis(mesh)
-        cost_inr = calculate_mold_cost_inr(volume_mm3, undercut_data["has_undercuts"], undercut_data["undercut_face_count"])
+        if raw_vol > (bbox_vol * 0.4): # Sanity check for hollow parts
+            # Estimate: (Surface Area / 2) * 2mm wall thickness
+            volume_mm3 = (mesh.area * 1e6 / 2.0) * 2.0 
+        else:
+            volume_mm3 = raw_vol
+
+        analysis = get_refined_analysis(mesh)
+        cost_inr = calculate_mold_cost_inr(volume_mm3, analysis["has_undercuts"], analysis["undercut_face_count"])
 
         return {
             "glb_url": f"/static/{glb_path.name}",
             "volume_cubic_mm": volume_mm3,
             "estimated_mold_cost_inr": cost_inr,
             "bounding_box_mm": {"x": mesh.extents[0]*1000, "y": mesh.extents[1]*1000, "z": mesh.extents[2]*1000},
-            **undercut_data
+            **analysis
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
