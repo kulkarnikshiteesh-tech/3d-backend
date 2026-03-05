@@ -3,45 +3,47 @@ import os, shutil, tempfile, traceback
 from pathlib import Path
 from uuid import uuid4
 import cascadio, trimesh, numpy as np
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 STATIC_DIR = Path("static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-def calculate_mold_cost_inr(volume_mm3, has_undercuts):
-    base_cost = 28000.0 
-    volume_cm3 = volume_mm3 / 1000.0
-    size_factor = volume_cm3 * 0.05 
-    undercut_penalty = 45000.0 if has_undercuts else 0.0
-    return round(base_cost + size_factor + undercut_penalty, 2)
-
-def analyze_axis_for_trapped_faces(mesh, axis_vector):
-    pull_dir = np.array(axis_vector) / np.linalg.norm(axis_vector)
-    dots = np.abs(np.dot(mesh.face_normals, pull_dir))
-    side_indices = np.where(dots < 0.1)[0]
+def get_advanced_analysis(mesh):
+    """Detects best pull axis and trapped side-features (undercuts)."""
+    axes = {"X-Axis": [1,0,0], "Y-Axis": [0,1,0], "Z-Axis": [0,0,1]}
+    results = {}
     
-    if len(side_indices) == 0: return 0
-
-    origins = mesh.triangles_center[side_indices]
-    try:
-        # Sandwich check: Look 'Forward' and 'Backward' along the axis
-        hits_f = mesh.ray.intersects_any(origins + (pull_dir * 0.1), np.tile(pull_dir, (len(origins), 1)))
-        hits_b = mesh.ray.intersects_any(origins - (pull_dir * 0.1), np.tile(-pull_dir, (len(origins), 1)))
-        return int(np.sum(np.logical_and(hits_f, hits_b)))
-    except:
-        return 9999
-
-def get_best_orientation_analysis(mesh):
-    axes = {"X-Axis": [1, 0, 0], "Y-Axis": [0, 1, 0], "Z-Axis": [0, 0, 1]}
-    results = {name: analyze_axis_for_trapped_faces(mesh, vec) for name, vec in axes.items()}
-    optimal_axis = min(results, key=results.get)
-    undercut_count = results[optimal_axis]
-    return undercut_count > 40, undercut_count, optimal_axis
+    for name, vec in axes.items():
+        pull = np.array(vec)
+        # Find faces perpendicular to pull (walls)
+        dots = np.abs(np.dot(mesh.face_normals, pull))
+        side_idx = np.where(dots < 0.1)[0]
+        if len(side_idx) == 0:
+            results[name] = 0
+            continue
+        
+        origins = mesh.triangles_center[side_idx]
+        try:
+            # Sandwich Test: Is it blocked both ways along the pull axis?
+            f = mesh.ray.intersects_any(origins + (pull * 0.1), np.tile(pull, (len(origins), 1)))
+            b = mesh.ray.intersects_any(origins - (pull * 0.1), np.tile(-pull, (len(origins), 1)))
+            results[name] = int(np.sum(np.logical_and(f, b)))
+        except:
+            results[name] = 999
+            
+    best_axis = min(results, key=results.get)
+    u_count = results[best_axis]
+    has_undercuts = u_count > 50 # Threshold to ignore noise
+    # Severity calculation for your UI
+    severity = "High" if u_count > 500 else "Medium" if u_count > 50 else "None"
+    
+    return has_undercuts, u_count, best_axis, severity
 
 @app.post("/upload")
 async def upload_step(file: UploadFile = File(...)):
@@ -54,28 +56,25 @@ async def upload_step(file: UploadFile = File(...)):
         scene = trimesh.load(str(glb_path))
         mesh = trimesh.util.concatenate([g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)])
 
-        # Volume Guardrail
-        bbox_vol = np.prod(mesh.extents) * 1e9
-        measured_vol = abs(mesh.volume) * 1e9
-        volume_mm3 = (mesh.area * 1e6 / 2.0) * 1.5 if measured_vol > (bbox_vol * 0.5) else measured_vol
-
-        # Orientation Analysis
-        has_undercut, u_count, best_axis = get_best_orientation_analysis(mesh)
+        # Volume & Bounding Box for Index.tsx
+        dims = mesh.extents * 1000 # Convert to mm
+        bbox = {"x": round(dims[0], 1), "y": round(dims[1], 1), "z": round(dims[2], 1)}
         
-        # Costs
-        mold_cost = calculate_mold_cost_inr(volume_mm3, has_undercut)
-        per_piece = round((volume_mm3 / 69311.0) * 18.29, 2)
+        measured_vol = abs(mesh.volume) * 1e9
+        # Enclosure shell logic
+        volume_mm3 = (mesh.area * 1e6 / 2.0) * 1.5 if measured_vol > (np.prod(dims) * 0.5) else measured_vol
 
-        # Return JSON with exact keys expected by Frontend
+        has_u, u_count, axis, severity = get_advanced_analysis(mesh)
+        
+        # Match keys in Index.tsx exactly
         return {
             "glb_url": f"/static/{glb_path.name}",
-            "volume_cubic_mm": volume_mm3,
-            "estimated_mold_cost_inr": mold_cost,
-            "estimated_per_piece_inr": per_piece,
-            "has_undercuts": has_undercut,
-            "undercut_face_count": u_count,
-            "optimal_axis": best_axis,
-            "undercut_message": f"Optimal Pull: {best_axis}. " + ("Side-actions required." if has_undercut else "Straight-pull compatible.")
+            "volume_cubic_mm": round(volume_mm3, 2),
+            "bounding_box_mm": bbox,
+            "has_undercuts": has_u,
+            "undercut_severity": severity,
+            "optimal_axis": axis,
+            "undercut_message": f"Optimal Pull: {axis}. " + ("Side-actions required." if has_u else "Straight-pull compatible.")
         }
     except Exception as e:
         print(traceback.format_exc())
