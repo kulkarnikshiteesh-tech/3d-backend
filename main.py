@@ -42,35 +42,42 @@ async def global_exception_handler(request: Request, exc: Exception):
 async def health():
     return {"status": "ok"}
 
-def calculate_mold_cost(volume_mm3, has_undercuts, undercut_count):
+def calculate_mold_cost_inr(volume_mm3, has_undercuts, undercut_count):
     """
-    Cost Engine: Calculates base tooling + size complexity + slider penalties.
+    Cost Engine (INR - Indian Market Data):
+    - Base Tooling: ₹1,50,000 - ₹2,50,000 for standard aluminum/soft steel molds.
+    - Material Complexity: Scaled by part volume.
+    - Side-Action (Sliders): ₹45,000 - ₹85,000 per mechanism in India.
     """
-    base_cost = 2500.0 
-    size_factor = (volume_mm3 / 1000) * 0.05 
+    # Base setup cost for a standard mold in India
+    base_cost_inr = 185000.0 
     
-    undercut_penalty = 0.0
+    # Material/Size complexity (roughly ₹4.5 per cm3 for tooling scale)
+    size_factor_inr = (volume_mm3 / 1000) * 4.5 
+    
+    undercut_penalty_inr = 0.0
     if has_undercuts:
-        # Every ~150 faces suggests a distinct side-action requirement (slider/lifter)
-        num_sliders = max(1, undercut_count // 150)
-        undercut_penalty = num_sliders * 1800.0 
+        # Every ~180 faces suggests a distinct side-action slider/lifter
+        num_sliders = max(1, undercut_count // 180)
+        # Average cost of an imported or precision Indian slider mechanism
+        undercut_penalty_inr = num_sliders * 65000.0 
 
-    total_usd = base_cost + size_factor + undercut_penalty
-    return round(total_usd, 2)
+    total_inr = base_cost_inr + size_factor_inr + undercut_penalty_inr
+    return round(total_inr, 2)
 
 def analyze_undercuts_geometric(mesh, pull_axis):
     """
     Strict Geometric Filter:
     - Ignores vertical walls (parallel to pull).
-    - Ignores flat floors (perpendicular to pull but not trapped).
-    - Flags overhangs that would physically trap a mold plate.
+    - Ignores horizontal floors (flat bottoms of holes).
+    - Only flags true 'trapped' geometry.
     """
     pull_vec = np.array(pull_axis) / np.linalg.norm(pull_axis)
     dots = np.dot(mesh.face_normals, pull_vec)
     
-    # Thresholds: Ignore near-vertical (dots ~0) and near-flat (dots ~ -1.0)
-    # This specifically removes false positives from Z-axis holes and pockets.
-    undercut_mask = (dots < -0.15) & (dots > -0.98)
+    # Filter: Ignores dots near 0 (vertical) and dots near -1.0 (flat floors)
+    # This prevents hole bottoms from being flagged as undercuts.
+    undercut_mask = (dots < -0.18) & (dots > -0.97)
     undercut_indices = np.where(undercut_mask)[0]
     
     return {
@@ -80,8 +87,8 @@ def analyze_undercuts_geometric(mesh, pull_axis):
 
 def get_best_mold_analysis(mesh):
     """
-    ORIENTATION INDEPENDENT LOGIC:
-    Independent test of X, Y, and Z to find the pull direction with the fewest constraints.
+    BRUTE FORCE AXIS SEARCH:
+    Independently tests X, Y, and Z to find the pull direction with the fewest issues.
     """
     axes = {"X-Axis": [1, 0, 0], "Y-Axis": [0, 1, 0], "Z-Axis": [0, 0, 1]}
     results = []
@@ -90,16 +97,16 @@ def get_best_mold_analysis(mesh):
         res = analyze_undercuts_geometric(mesh, vector)
         results.append({"axis": name, "data": res})
 
-    # Select the axis that minimizes 'trapped' geometry
+    # Find the axis that minimizes 'trapped' geometry
     best = min(results, key=lambda x: x["data"]["count"])
     
-    # Buffer to ignore minor mesh artifacts (80 faces) common in low-res conversions
-    has_undercuts = best["data"]["count"] > 80 
+    # Buffer to ignore mesh noise (100 faces) from STEP-to-GLB conversion artifacts
+    has_undercuts = best["data"]["count"] > 100 
     
     return {
         "has_undercuts": has_undercuts,
         "undercut_face_count": int(best["data"]["count"]),
-        "undercut_severity": "high" if best["data"]["count"] > 300 else "low",
+        "undercut_severity": "high" if best["data"]["count"] > 400 else "low",
         "optimal_axis": best["axis"],
         "undercut_message": (
             f"Undercut detected. Optimal pull is {best['axis']}. Side-actions required."
@@ -135,14 +142,13 @@ async def upload_step(file: UploadFile = File(...)):
             mesh = loaded
 
         # 3. Robust Volume Calculation (mm3)
-        # Using abs() ensures valid output even if normals are inverted.
         volume_mm3 = abs(float(mesh.volume)) * 1e9
 
-        # 4. Independent Axis Analysis
+        # 4. Independent Axis Analysis (Orientation Independent)
         undercut_data = get_best_mold_analysis(mesh)
 
-        # 5. Dynamic Cost Estimation
-        estimated_mold_cost_usd = calculate_mold_cost(
+        # 5. INR Cost Calculation
+        estimated_mold_cost_inr = calculate_mold_cost_inr(
             volume_mm3, 
             undercut_data["has_undercuts"], 
             undercut_data["undercut_face_count"]
@@ -155,7 +161,7 @@ async def upload_step(file: UploadFile = File(...)):
             "glb_url": f"/static/{glb_name}",
             "volume_cubic_mm": volume_mm3,
             "bounding_box_mm": {"x": extents[0], "y": extents[1], "z": extents[2]},
-            "estimated_mold_cost_usd": estimated_mold_cost_usd,
+            "estimated_mold_cost_inr": estimated_mold_cost_inr,
             **undercut_data,
         }
 
