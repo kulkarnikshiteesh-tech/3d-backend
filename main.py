@@ -19,38 +19,41 @@ def sanitize(val):
         return 0.0 if math.isnan(val) or math.isinf(val) else val
     return val
 
+def cleanup_static():
+    import time
+    now = time.time()
+    for f in STATIC_DIR.glob("*.glb"):
+        if f.stat().st_mtime < now - 600:
+            try: f.unlink()
+            except: pass
+
 def analyze_undercuts_raytrace(mesh, pull_axis):
     """
-    Professional Ray-Tracing: Detects faces trapped between plastic.
-    Using sampled centers and restricted ray-distance to save RAM.
+    Detects if vertical walls are 'trapped' by geometry above and below.
+    This is the only way to accurately distinguish between a hole in the top
+    (straight-pull) and a hole in the side (undercut).
     """
     direction = np.array(pull_axis) / np.linalg.norm(pull_axis)
-    
-    # Step 1: Only check faces that are parallel to the pull (the walls)
-    # This reduces the number of rays by 70%, preventing the 500 error.
     dots = np.dot(mesh.face_normals, direction)
-    potential_u_idx = np.where(np.abs(dots) < 0.1)[0]
     
+    # Target only vertical walls relative to this axis
+    potential_u_idx = np.where(np.abs(dots) < 0.05)[0]
     if len(potential_u_idx) == 0:
         return 0.0
 
-    # Step 2: Sample origins from the centers of these vertical faces
     origins = mesh.triangles_center[potential_u_idx]
-    epsilon = mesh.scale * 0.0001
+    epsilon = mesh.scale * 0.001
     
-    # Step 3: Fire Rays both ways. 
-    # If a wall hits plastic both UP and DOWN, it is an undercut.
-    # 
+    # Fire rays: An undercut exists only if the wall is blocked BOTH ways
     hits_up = mesh.ray.intersects_any(origins + direction * epsilon, np.tile(direction, (len(origins), 1)))
     hits_down = mesh.ray.intersects_any(origins - direction * epsilon, np.tile(-direction, (len(origins), 1)))
     
     undercut_mask = np.logical_and(hits_up, hits_down)
-    undercut_area = np.sum(mesh.area_faces[potential_u_idx][undercut_mask])
-    
-    return float(undercut_area)
+    return float(np.sum(mesh.area_faces[potential_u_idx][undercut_mask]))
 
 @app.post("/upload")
 async def upload_step(request: Request, file: UploadFile = File(...)):
+    cleanup_static()
     tmp_step = Path(tempfile.gettempdir()) / f"{uuid4()}.step"
     glb_filename = f"{uuid4()}.glb"
     glb_path = STATIC_DIR / glb_filename
@@ -60,36 +63,34 @@ async def upload_step(request: Request, file: UploadFile = File(...)):
             shutil.copyfileobj(file.file, f)
         
         cascadio.step_to_glb(str(tmp_step), str(glb_path))
-        
-        # Load and verify mesh
         scene = trimesh.load(str(glb_path))
         mesh = trimesh.util.concatenate([g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)])
 
-        # Part Metrics
+        # 1. Dimensions & Volume
         dims = mesh.extents * 1000
         bbox = {"x": sanitize(round(dims[0], 1)), "y": sanitize(round(dims[1], 1)), "z": sanitize(round(dims[2], 1))}
-        
-        # Volume Calculation (Handling enclosures)
         v_raw = abs(mesh.volume) * 1e9
-        volume_mm3 = sanitize(v_raw if v_raw > 100 else (mesh.area * 1e6 / 2.0) * 1.5)
+        volume_mm3 = sanitize(v_raw if v_raw > 500 else (mesh.area * 1e6 / 2.0) * 1.5)
 
-        # THE ANALYSIS (Ray-Tracing X, Y, and Z)
+        # 2. Advanced Orientation Logic
         axes = {"X-Axis": [1,0,0], "Y-Axis": [0,1,0], "Z-Axis": [0,0,1]}
-        
-        # Calculate undercut area for each axis
-        # 
         areas = {n: analyze_undercuts_raytrace(mesh, v) for n, v in axes.items()}
         
-        # Add a "preference" for Z-axis (standard for enclosures)
-        # We only switch from Z if another axis has significantly fewer undercuts
-        scores = {n: (areas[n] if n == "Z-Axis" else areas[n] + (mesh.area * 0.1)) for n in areas}
-        best_axis = min(scores, key=scores.get)
-        
-        final_u_area = areas[best_axis]
-        has_u = bool(final_u_area > (mesh.area * 0.001)) # 0.1% area threshold
+        # LOGIC FIX: Enforce Z-Axis priority for enclosures
+        # If Z-Axis has negligible undercut area, force it as the optimal axis
+        z_threshold = mesh.area * 0.0005 # 0.05% threshold
+        if areas["Z-Axis"] <= z_threshold:
+            best_axis = "Z-Axis"
+            has_u = False
+        else:
+            # Only if Z is blocked do we check if X or Y is better
+            best_axis = min(areas, key=areas.get)
+            has_u = areas[best_axis] > z_threshold
 
-        # Pricing (₹45k penalty for side-actions)
-        mold_cost = float(30000.0 + (volume_mm3/1000 * 0.10) + (45000.0 if has_u else 0.0))
+        # 3. Costing (Indian Market Rates)
+        # Base Tooling + Volume Factor + Slider Penalty
+        slider_penalty = 45000.0 if has_u else 0.0
+        mold_cost = float(28000.0 + (volume_mm3/1000 * 0.08) + slider_penalty)
 
         return {
             "glb_url": f"{str(request.base_url).rstrip('/')}/static/{glb_filename}",
