@@ -15,17 +15,15 @@ os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 def sanitize(val):
-    """Prevents NaN/Infinity from breaking the Frontend JSON."""
     if isinstance(val, (float, int)):
         return 0.0 if math.isnan(val) or math.isinf(val) else val
     return val
 
 def cleanup_static():
-    """Deletes files older than 10 minutes to save Render disk space."""
     import time
     now = time.time()
     for f in STATIC_DIR.glob("*.glb"):
-        if f.stat().st_mtime < now - 600:
+        if f.stat().st_mtime < now - 600: # Delete files older than 10 mins
             try: f.unlink()
             except: pass
 
@@ -34,7 +32,7 @@ def calculate_undercut_stats(mesh, pull_axis):
     dots = np.dot(mesh.face_normals, direction)
     epsilon = mesh.scale * 0.001 
     
-    # Shadow analysis
+    # Check Upward/Downward/Side obstructions
     up_idx = np.where(dots > 0.1)[0]
     blocked_up = mesh.ray.intersects_any(mesh.triangles_center[up_idx] + direction * epsilon, np.tile(direction, (len(up_idx), 1)))
     
@@ -53,7 +51,7 @@ def calculate_undercut_stats(mesh, pull_axis):
 
 @app.post("/upload")
 async def upload_step(request: Request, file: UploadFile = File(...)):
-    cleanup_static() # Free up space
+    cleanup_static()
     tmp_step = Path(tempfile.gettempdir()) / f"{uuid4()}.step"
     glb_filename = f"{uuid4()}.glb"
     glb_path = STATIC_DIR / glb_filename
@@ -65,35 +63,38 @@ async def upload_step(request: Request, file: UploadFile = File(...)):
         scene = trimesh.load(str(glb_path))
         mesh = trimesh.util.concatenate([g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)])
 
-        # 1. Calculation
+        # PERFORMANCE: Simplify mesh if it's too heavy (>15k faces)
+        if len(mesh.faces) > 15000:
+            mesh = mesh.simplify_quadratic_decimation(10000)
+            mesh.export(str(glb_path)) # Overwrite with lighter GLB for frontend
+
+        # DFM Logic
         dims = mesh.extents * 1000
         bbox = {"x": sanitize(round(dims[0], 1)), "y": sanitize(round(dims[1], 1)), "z": sanitize(round(dims[2], 1))}
         measured_vol = abs(mesh.volume) * 1e9
         volume_mm3 = sanitize((mesh.area * 1e6 / 2.0) * 1.5 if measured_vol > (np.prod(dims) * 0.4) else measured_vol)
 
-        # 2. Undercut Analysis
         axes = {"X-Axis": [1,0,0], "Y-Axis": [0,1,0], "Z-Axis": [0,0,1]}
         scores = {n: calculate_undercut_stats(mesh, v) + (0 if n == "Z-Axis" else mesh.area*0.05) for n, v in axes.items()}
         best_axis = min(scores, key=scores.get)
         actual_u_area = calculate_undercut_stats(mesh, axes[best_axis])
         
-        has_u = actual_u_area > (mesh.area * 0.005)
-        
-        # 3. Create ABSOLUTE URL
-        # This fixes the Vercel loading issue by telling the frontend exactly where to find the file
-        base_url = str(request.base_url).rstrip('/')
-        full_glb_url = f"{base_url}/static/{glb_filename}"
+        has_u = bool(actual_u_area > (mesh.area * 0.005))
+        mold_cost = float(28000.0 + (volume_mm3/1000 * 0.05) + (45000.0 if has_u else 0.0))
 
+        # Absolute URL for cross-domain stability (Render -> Vercel)
+        base_url = str(request.base_url).rstrip('/')
         return {
-            "glb_url": full_glb_url,
+            "glb_url": f"{base_url}/static/{glb_filename}",
             "volume_cubic_mm": volume_mm3,
             "bounding_box_mm": bbox,
-            "has_undercuts": bool(has_u),
+            "has_undercuts": has_u,
+            "mold_cost_inr": mold_cost,
             "optimal_axis": best_axis,
             "undercut_message": f"Optimal Pull: {best_axis}. " + ("Requires sliders." if has_u else "Straight-pull.")
         }
-    except Exception as e:
-        print(f"ERROR: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail="Internal processing error")
+    except:
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Processing failed")
     finally:
         if tmp_step.exists(): tmp_step.unlink()
