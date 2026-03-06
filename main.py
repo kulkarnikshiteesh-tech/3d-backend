@@ -21,32 +21,25 @@ os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 def analyze_undercuts_strict(mesh, pull_axis):
-    """
-    Simulation of mold ejection. 
-    Checks if any face is physically obstructed along the ejection path.
-    """
     direction = np.array(pull_axis, dtype=float)
     direction /= np.linalg.norm(direction)
     
-    # We only care about 'back' faces that have to move through the rest of the part
+    # Identify faces pointing 'down' into the core
     back_mask = np.dot(mesh.face_normals, direction) < -0.1
     if not np.any(back_mask):
         return 0.0
 
-    # Offset ray slightly to avoid immediate self-collision
     epsilon = mesh.scale * 0.001
     origins = mesh.triangles_center[back_mask] - (direction * epsilon)
     
-    # Check for obstructions along the ejection path
+    # Ray-cast to find internal obstructions
     hits = mesh.ray.intersects_any(origins, np.tile(direction, (len(origins), 1)))
     
-    # Sum the area of blocked faces
     blocked_area = np.sum(mesh.area_faces[back_mask][hits])
     return float(blocked_area)
 
 @app.get("/")
-async def health():
-    return {"status": "online"}
+async def health(): return {"status": "online"}
 
 @app.post("/upload")
 async def upload_step(request: Request, file: UploadFile = File(...)):
@@ -61,35 +54,34 @@ async def upload_step(request: Request, file: UploadFile = File(...)):
             f.write(content)
         del content
         
-        # 0.8 Precision for stability on Render Free Tier
+        # 0.8 Precision for Render stability
         cascadio.step_to_glb(str(tmp_step), str(glb_path), 0.8)
         
         scene = trimesh.load(str(glb_path))
         geometry = [g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)]
-        if not geometry:
-            raise ValueError("No valid geometry found")
+        if not geometry: raise ValueError("No mesh found")
         mesh = trimesh.util.concatenate(geometry)
         
-        # 6-Axis Search
-        test_dirs = {"X": [1,0,0], "-X": [-1,0,0], "Y": [0,1,0], "-Y": [0,-1,0], "Z": [0,0,1], "-Z": [0,0,-1]}
+        # 1. TOTAL SURFACE AREA for relative thresholding
+        total_area = mesh.area
         
-        # Calculate raw obstruction area for all axes
+        # 2. 6-AXIS SEARCH
+        test_dirs = {"X": [1,0,0], "-X": [-1,0,0], "Y": [0,1,0], "-Y": [0,-1,0], "Z": [0,0,1], "-Z": [0,0,-1]}
         raw_results = {n: analyze_undercuts_strict(mesh, v) for n, v in test_dirs.items()}
         
-        # Apply 20% bias to Z-axes for CAD alignment standards
+        # 3. Z-PREFERENCE (80% bias to favor standard CAD orientation)
         weighted_results = raw_results.copy()
-        weighted_results["Z"] *= 0.8
-        weighted_results["-Z"] *= 0.8
+        weighted_results["Z"] *= 0.2  # Massive bias to favor Z-pull for shells
+        weighted_results["-Z"] *= 0.2
 
-        # Select the best axis based on weighted math
         best_axis = min(weighted_results, key=weighted_results.get)
         
-        # Threshold: 150mm2 allows for mesh artifacts on large curved parts like hair dryers
-        # but will still catch real side-windows or holes.
-        area_mm2 = raw_results[best_axis] * 1e6
-        has_u = bool(area_mm2 > 150.0)
+        # 4. PERCENTAGE THRESHOLD (The Noise Filter)
+        # Only flag if undercut area > 1.5% of total part area
+        undercut_ratio = raw_results[best_axis] / total_area
+        has_u = bool(undercut_ratio > 0.015) 
 
-        # Basic Stats
+        # Physicals
         vol = abs(float(mesh.volume)) * 1e9
         dims = mesh.extents * 1000
         
@@ -107,7 +99,6 @@ async def upload_step(request: Request, file: UploadFile = File(...)):
             "mold_cost_inr": round(total_cost, 2)
         }
     except Exception as e:
-        print(traceback.format_exc())
         return {"error": str(e)}
     finally:
         if tmp_step.exists(): tmp_step.unlink()
