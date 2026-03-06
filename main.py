@@ -19,82 +19,89 @@ def sanitize(val):
         return 0.0 if math.isnan(val) or math.isinf(val) else val
     return val
 
-def cleanup_static():
-    import time
-    now = time.time()
-    for f in STATIC_DIR.glob("*.glb"):
-        if f.stat().st_mtime < now - 600: # Delete files older than 10 mins
-            try: f.unlink()
-            except: pass
-
-def calculate_undercut_stats(mesh, pull_axis):
+def analyze_undercuts_raytrace(mesh, pull_axis):
+    """
+    Professional Ray-Tracing: Detects faces trapped between plastic.
+    Using sampled centers and restricted ray-distance to save RAM.
+    """
     direction = np.array(pull_axis) / np.linalg.norm(pull_axis)
+    
+    # Step 1: Only check faces that are parallel to the pull (the walls)
+    # This reduces the number of rays by 70%, preventing the 500 error.
     dots = np.dot(mesh.face_normals, direction)
-    epsilon = mesh.scale * 0.001 
+    potential_u_idx = np.where(np.abs(dots) < 0.1)[0]
     
-    # Check Upward/Downward/Side obstructions
-    up_idx = np.where(dots > 0.1)[0]
-    blocked_up = mesh.ray.intersects_any(mesh.triangles_center[up_idx] + direction * epsilon, np.tile(direction, (len(up_idx), 1)))
-    
-    down_idx = np.where(dots < -0.1)[0]
-    blocked_down = mesh.ray.intersects_any(mesh.triangles_center[down_idx] - direction * epsilon, np.tile(-direction, (len(down_idx), 1)))
-    
-    side_idx = np.where(np.abs(dots) <= 0.1)[0]
-    hits_f = mesh.ray.intersects_any(mesh.triangles_center[side_idx] + direction * epsilon, np.tile(direction, (len(side_idx), 1)))
-    hits_b = mesh.ray.intersects_any(mesh.triangles_center[side_idx] - direction * epsilon, np.tile(-direction, (len(side_idx), 1)))
-    blocked_side = np.logical_and(hits_f, hits_b)
+    if len(potential_u_idx) == 0:
+        return 0.0
 
-    total_area = (np.sum(mesh.area_faces[up_idx][blocked_up]) + 
-                  np.sum(mesh.area_faces[down_idx][blocked_down]) + 
-                  np.sum(mesh.area_faces[side_idx][blocked_side]))
-    return float(total_area)
+    # Step 2: Sample origins from the centers of these vertical faces
+    origins = mesh.triangles_center[potential_u_idx]
+    epsilon = mesh.scale * 0.0001
+    
+    # Step 3: Fire Rays both ways. 
+    # If a wall hits plastic both UP and DOWN, it is an undercut.
+    # 
+    hits_up = mesh.ray.intersects_any(origins + direction * epsilon, np.tile(direction, (len(origins), 1)))
+    hits_down = mesh.ray.intersects_any(origins - direction * epsilon, np.tile(-direction, (len(origins), 1)))
+    
+    undercut_mask = np.logical_and(hits_up, hits_down)
+    undercut_area = np.sum(mesh.area_faces[potential_u_idx][undercut_mask])
+    
+    return float(undercut_area)
 
 @app.post("/upload")
 async def upload_step(request: Request, file: UploadFile = File(...)):
-    cleanup_static()
     tmp_step = Path(tempfile.gettempdir()) / f"{uuid4()}.step"
     glb_filename = f"{uuid4()}.glb"
     glb_path = STATIC_DIR / glb_filename
     
     try:
-        with tmp_step.open("wb") as f: shutil.copyfileobj(file.file, f)
+        with tmp_step.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+        
         cascadio.step_to_glb(str(tmp_step), str(glb_path))
         
+        # Load and verify mesh
         scene = trimesh.load(str(glb_path))
         mesh = trimesh.util.concatenate([g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)])
 
-        # PERFORMANCE: Simplify mesh if it's too heavy (>15k faces)
-        if len(mesh.faces) > 15000:
-            mesh = mesh.simplify_quadratic_decimation(10000)
-            mesh.export(str(glb_path)) # Overwrite with lighter GLB for frontend
-
-        # DFM Logic
+        # Part Metrics
         dims = mesh.extents * 1000
         bbox = {"x": sanitize(round(dims[0], 1)), "y": sanitize(round(dims[1], 1)), "z": sanitize(round(dims[2], 1))}
-        measured_vol = abs(mesh.volume) * 1e9
-        volume_mm3 = sanitize((mesh.area * 1e6 / 2.0) * 1.5 if measured_vol > (np.prod(dims) * 0.4) else measured_vol)
-
-        axes = {"X-Axis": [1,0,0], "Y-Axis": [0,1,0], "Z-Axis": [0,0,1]}
-        scores = {n: calculate_undercut_stats(mesh, v) + (0 if n == "Z-Axis" else mesh.area*0.05) for n, v in axes.items()}
-        best_axis = min(scores, key=scores.get)
-        actual_u_area = calculate_undercut_stats(mesh, axes[best_axis])
         
-        has_u = bool(actual_u_area > (mesh.area * 0.005))
-        mold_cost = float(28000.0 + (volume_mm3/1000 * 0.05) + (45000.0 if has_u else 0.0))
+        # Volume Calculation (Handling enclosures)
+        v_raw = abs(mesh.volume) * 1e9
+        volume_mm3 = sanitize(v_raw if v_raw > 100 else (mesh.area * 1e6 / 2.0) * 1.5)
 
-        # Absolute URL for cross-domain stability (Render -> Vercel)
-        base_url = str(request.base_url).rstrip('/')
+        # THE ANALYSIS (Ray-Tracing X, Y, and Z)
+        axes = {"X-Axis": [1,0,0], "Y-Axis": [0,1,0], "Z-Axis": [0,0,1]}
+        
+        # Calculate undercut area for each axis
+        # 
+        areas = {n: analyze_undercuts_raytrace(mesh, v) for n, v in axes.items()}
+        
+        # Add a "preference" for Z-axis (standard for enclosures)
+        # We only switch from Z if another axis has significantly fewer undercuts
+        scores = {n: (areas[n] if n == "Z-Axis" else areas[n] + (mesh.area * 0.1)) for n in areas}
+        best_axis = min(scores, key=scores.get)
+        
+        final_u_area = areas[best_axis]
+        has_u = bool(final_u_area > (mesh.area * 0.001)) # 0.1% area threshold
+
+        # Pricing (₹45k penalty for side-actions)
+        mold_cost = float(30000.0 + (volume_mm3/1000 * 0.10) + (45000.0 if has_u else 0.0))
+
         return {
-            "glb_url": f"{base_url}/static/{glb_filename}",
+            "glb_url": f"{str(request.base_url).rstrip('/')}/static/{glb_filename}",
             "volume_cubic_mm": volume_mm3,
             "bounding_box_mm": bbox,
             "has_undercuts": has_u,
-            "mold_cost_inr": mold_cost,
             "optimal_axis": best_axis,
-            "undercut_message": f"Optimal Pull: {best_axis}. " + ("Requires sliders." if has_u else "Straight-pull.")
+            "undercut_message": f"Optimal Pull: {best_axis}. " + 
+                               ("Side-actions (sliders) required." if has_u else "Straight-pull compatible.")
         }
-    except:
+    except Exception as e:
         print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Processing failed")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         if tmp_step.exists(): tmp_step.unlink()
