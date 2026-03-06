@@ -29,13 +29,19 @@ def analyze_undercuts_strict(mesh, pull_axis):
     if not np.any(back_mask):
         return 0.0
 
+    # NEW: Only fire rays from faces larger than a tiny speck (0.5mm2)
+    # This ignores the jagged edges of vents that cause false positives
+    significant_faces = (mesh.area_faces > 0.0000005) & back_mask
+    if not np.any(significant_faces):
+        return 0.0
+
     epsilon = mesh.scale * 0.001
-    origins = mesh.triangles_center[back_mask] - (direction * epsilon)
+    origins = mesh.triangles_center[significant_faces] - (direction * epsilon)
     
     # Ray-cast to find internal obstructions
     hits = mesh.ray.intersects_any(origins, np.tile(direction, (len(origins), 1)))
     
-    blocked_area = np.sum(mesh.area_faces[back_mask][hits])
+    blocked_area = np.sum(mesh.area_faces[significant_faces][hits])
     return float(blocked_area)
 
 @app.get("/")
@@ -54,7 +60,7 @@ async def upload_step(request: Request, file: UploadFile = File(...)):
             f.write(content)
         del content
         
-        # 0.8 Precision for Render stability
+        # Keep 0.8 precision for Render's 512MB RAM limit
         cascadio.step_to_glb(str(tmp_step), str(glb_path), 0.8)
         
         scene = trimesh.load(str(glb_path))
@@ -62,24 +68,23 @@ async def upload_step(request: Request, file: UploadFile = File(...)):
         if not geometry: raise ValueError("No mesh found")
         mesh = trimesh.util.concatenate(geometry)
         
-        # 1. TOTAL SURFACE AREA for relative thresholding
         total_area = mesh.area
         
-        # 2. 6-AXIS SEARCH
+        # 6-AXIS SEARCH
         test_dirs = {"X": [1,0,0], "-X": [-1,0,0], "Y": [0,1,0], "-Y": [0,-1,0], "Z": [0,0,1], "-Z": [0,0,-1]}
         raw_results = {n: analyze_undercuts_strict(mesh, v) for n, v in test_dirs.items()}
         
-        # 3. Z-PREFERENCE (80% bias to favor standard CAD orientation)
+        # Massive Z-Preference for shell-style parts
         weighted_results = raw_results.copy()
-        weighted_results["Z"] *= 0.2  # Massive bias to favor Z-pull for shells
-        weighted_results["-Z"] *= 0.2
+        weighted_results["Z"] *= 0.1 
+        weighted_results["-Z"] *= 0.1
 
         best_axis = min(weighted_results, key=weighted_results.get)
         
-        # 4. PERCENTAGE THRESHOLD (The Noise Filter)
-        # Only flag if undercut area > 1.5% of total part area
+        # RATIO THRESHOLD: Increased to 3% to handle high-detail vents
+        # A real slider (like a side hole) will always be >3% of a shell's area.
         undercut_ratio = raw_results[best_axis] / total_area
-        has_u = bool(undercut_ratio > 0.015) 
+        has_u = bool(undercut_ratio > 0.03) 
 
         # Physicals
         vol = abs(float(mesh.volume)) * 1e9
