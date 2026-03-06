@@ -28,17 +28,16 @@ def sanitize(val):
 
 def analyze_undercuts_raytrace(mesh, pull_axis):
     """
-    Robust Core/Cavity simulation using face-normal offsets to prevent 
-    self-intersection noise on flat walls.
+    Standard Core/Cavity simulation. 
+    Offsets ray origins to avoid 'self-hitting' mesh noise.
     """
     direction = np.array(pull_axis, dtype=float)
     direction /= np.linalg.norm(direction)
     
-    # Dot product to find faces pointing roughly in the pull direction
+    # Identify faces pointing towards the mold movement
     up_mask = np.dot(mesh.face_normals, direction) > 0.1
     down_mask = np.dot(mesh.face_normals, direction) < -0.1
     
-    # Epsilon: Offset the ray start point so it doesn't 'hit' its own face
     epsilon = mesh.scale * 0.001
     undercut_area = 0.0
     
@@ -56,63 +55,55 @@ def analyze_undercuts_raytrace(mesh, pull_axis):
 
 @app.post("/upload")
 async def upload_step(request: Request, file: UploadFile = File(...)):
-    # 1. Force RAM purge from any previous failed sessions
-    gc.collect() 
+    gc.collect() # Pre-emptive RAM cleanup
     
     tmp_step = Path(tempfile.gettempdir()) / f"{uuid4()}.step"
     glb_filename = f"{uuid4()}.glb"
     glb_path = STATIC_DIR / glb_filename
     
     try:
-        # Save uploaded file
+        # Step 1: Securely save file
         content = await file.read()
         with tmp_step.open("wb") as f:
             f.write(content)
         del content
         
-        # 2. LOW-POLY CONVERSION (0.8)
-        # This keeps the Hair Dryer under 512MB RAM while preserving dimensions.
+        # Step 2: Low-Poly conversion for memory stability (0.8 precision)
         cascadio.step_to_glb(str(tmp_step), str(glb_path), 0.8) 
         
-        # 3. MEMORY EFFICIENT LOADING
+        # Step 3: Mesh loading and visual smoothing
         scene = trimesh.load(str(glb_path))
         geometry = [g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)]
-        if not geometry:
-            raise ValueError("No valid geometry in STEP file.")
-            
+        if not geometry: raise ValueError("Invalid Geometry")
         mesh = trimesh.util.concatenate(geometry)
+        mesh.fix_normals() # Smooths out the 0.8 blocky appearance in 3D viewer
         
-        # Optional: 'Fix' normals for smoother visual rendering despite low-poly count
-        mesh.fix_normals()
-        
-        # Clear scene from RAM immediately
         del scene
         gc.collect()
 
-        # Bounding Box Logic (Absolute Dimensions)
-        dims = mesh.extents * 1000
-        bbox = {
-            "x": sanitize(round(float(dims[0]), 1)),
-            "y": sanitize(round(float(dims[1]), 1)),
-            "z": sanitize(round(float(dims[2]), 1))
-        }
-        
-        # 4. UNIVERSAL 6-AXIS SEARCH
-        test_dirs = {"X": [1,0,0], "-X": [-1,0,0], "Y": [0,1,0], "-Y": [0,-1,0], "Z": [0,0,1], "-Z": [0,0,-1]}
-        results = {n: analyze_undercuts_raytrace(mesh, v) for n, v in test_dirs.items()}
-        
-        best_axis_raw = min(results, key=results.get)
-        min_u_area_mm2 = results[best_axis_raw] * 1e6
-        
-        # 5. THE 'PROJECT 08' FIX: 40mm2 threshold catches windows but ignores noise.
-        has_u = bool(min_u_area_mm2 > 40.0) 
-        display_axis = best_axis_raw.replace("-", "")
-
-        # Volume Logic
+        # Step 4: Physical Calculations (Volume & Bounding Box)
         v_raw = abs(float(mesh.volume)) * 1e9
         volume_mm3 = sanitize(v_raw if v_raw > 100 else (float(mesh.area) * 1e6 / 2.0) * 1.5)
         
-        # Cost Logic
+        dims = mesh.extents * 1000
+        bbox = {"x": sanitize(round(float(dims[0]), 1)), "y": sanitize(round(float(dims[1]), 1)), "z": sanitize(round(float(dims[2]), 1))}
+        
+        # Step 5: The 6-Axis Search with Organic Part Fixes
+        test_dirs = {"X": [1,0,0], "-X": [-1,0,0], "Y": [0,1,0], "-Y": [0,-1,0], "Z": [0,0,1], "-Z": [0,0,-1]}
+        results = {name: analyze_undercuts_raytrace(mesh, vec) for name, vec in test_dirs.items()}
+        
+        # Preference Weighting: Favor Z-axis to avoid Y-axis organic curvature noise
+        results["Z"] *= 0.8
+        results["-Z"] *= 0.8
+
+        best_axis_raw = min(results, key=results.get)
+        min_u_area_mm2 = results[best_axis_raw] * 1e6
+        
+        # Threshold: 100mm2 filter to ignore organic 'shadows' like hair dryer handle grips
+        has_u = bool(min_u_area_mm2 > 100.0)
+        display_axis = best_axis_raw.replace("-", "")
+
+        # Step 6: Pricing Logic
         slider_penalty = 45000.0 if has_u else 0.0
         mold_cost = float(28000.0 + (volume_mm3/1000 * 0.08) + slider_penalty)
 
@@ -128,13 +119,9 @@ async def upload_step(request: Request, file: UploadFile = File(...)):
 
     except Exception as e:
         print(traceback.format_exc())
-        return {
-            "error": str(e),
-            "has_undercuts": False,
-            "undercut_message": "Analysis failed. Model might be too large for free-tier memory."
-        }
+        return {"error": str(e), "undercut_message": "Analysis failed: Server rebooted or model too complex."}
     finally:
-        # 6. ABSOLUTE MEMORY WIPE
+        # Step 7: Final Memory Wipe
         if tmp_step.exists(): tmp_step.unlink()
         if 'mesh' in locals(): del mesh
         gc.collect()
