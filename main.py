@@ -9,7 +9,6 @@ from starlette.staticfiles import StaticFiles
 
 app = FastAPI()
 
-# Enable CORS for Vercel frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,20 +16,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Setup static directory for GLB files
 STATIC_DIR = Path("static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 def sanitize(val):
-    """Ensure numerical values are JSON-serializable and finite."""
     if isinstance(val, (float, int, np.float64, np.int64)):
         val = float(val)
         return 0.0 if math.isnan(val) or math.isinf(val) else val
     return val
 
 def cleanup_static():
-    """Remove files older than 10 minutes to save disk space on Render."""
     import time
     now = time.time()
     for f in STATIC_DIR.glob("*.glb"):
@@ -39,14 +35,9 @@ def cleanup_static():
             except: pass
 
 def analyze_undercuts_raytrace(mesh, pull_axis):
-    """
-    Professional Ray-Tracing: Identifies if a feature is trapped by geometry 
-    above and below it relative to the mold opening direction.
-    """
     direction = np.array(pull_axis) / np.linalg.norm(pull_axis)
     dots = np.dot(mesh.face_normals, direction)
     
-    # Filter for vertical walls (potential undercuts)
     potential_u_idx = np.where(np.abs(dots) < 0.05)[0]
     if len(potential_u_idx) == 0:
         return 0.0
@@ -54,11 +45,9 @@ def analyze_undercuts_raytrace(mesh, pull_axis):
     origins = mesh.triangles_center[potential_u_idx]
     epsilon = mesh.scale * 0.001
     
-    # Fire rays in both directions of the pull axis
     hits_up = mesh.ray.intersects_any(origins + direction * epsilon, np.tile(direction, (len(origins), 1)))
     hits_down = mesh.ray.intersects_any(origins - direction * epsilon, np.tile(-direction, (len(origins), 1)))
     
-    # An undercut is confirmed only if blocked in both directions
     undercut_mask = np.logical_and(hits_up, hits_down)
     return float(np.sum(mesh.area_faces[potential_u_idx][undercut_mask]))
 
@@ -70,19 +59,16 @@ async def upload_step(request: Request, file: UploadFile = File(...)):
     glb_path = STATIC_DIR / glb_filename
     
     try:
-        # Save uploaded file
         with tmp_step.open("wb") as f:
             shutil.copyfileobj(file.file, f)
         
-        # Convert STEP to GLB
         cascadio.step_to_glb(str(tmp_step), str(glb_path))
-        
-        # Load Mesh with Trimesh
         scene = trimesh.load(str(glb_path))
         mesh = trimesh.util.concatenate([g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)])
 
-        # 1. Bounding Box & Volume
-        dims = mesh.extents * 1000
+        # 1. Dimensions
+        extents = mesh.extents
+        dims = extents * 1000
         bbox = {
             "x": sanitize(round(float(dims[0]), 1)), 
             "y": sanitize(round(float(dims[1]), 1)), 
@@ -90,22 +76,26 @@ async def upload_step(request: Request, file: UploadFile = File(...)):
         }
         
         v_raw = abs(float(mesh.volume)) * 1e9
-        # Fallback for shells/enclosures where volume calculation might struggle
         volume_mm3 = sanitize(v_raw if v_raw > 500 else (float(mesh.area) * 1e6 / 2.0) * 1.5)
 
-        # 2. Orientation Logic (Z-Axis Preference)
-        axes = {"X-Axis": [1,0,0], "Y-Axis": [0,1,0], "Z-Axis": [0,0,1]}
-        areas = {n: float(analyze_undercuts_raytrace(mesh, v)) for n, v in axes.items()}
+        # 2. Orientation Logic (Shortest-Axis Priority)
+        # Identify which index (0=X, 1=Y, 2=Z) is the thinnest part of the part
+        shortest_dim_idx = int(np.argmin(extents)) 
+        axes_list = [[1,0,0], [0,1,0], [0,0,1]]
+        axes_names = ["X-Axis", "Y-Axis", "Z-Axis"]
         
-        # Threshold: Undercuts smaller than 0.05% of total area are ignored as noise
+        # Calculate undercut area for all 3 axes
+        areas = {axes_names[i]: float(analyze_undercuts_raytrace(mesh, axes_list[i])) for i in range(3)}
         threshold = float(mesh.area) * 0.0005 
         
-        # FORCE Z-Axis if it is clean (Standard Enclosure logic)
-        if areas["Z-Axis"] <= threshold:
-            best_axis = "Z-Axis"
+        # Check the shortest axis first (the likely pull direction)
+        preferred_axis = axes_names[shortest_dim_idx]
+        
+        if areas[preferred_axis] <= threshold:
+            best_axis = preferred_axis
             has_u = False
         else:
-            # Otherwise, find the axis with the absolute minimum undercut area
+            # Fallback only if the shortest axis is actually blocked
             best_axis = str(min(areas, key=areas.get))
             has_u = bool(areas[best_axis] > threshold)
 
@@ -113,7 +103,6 @@ async def upload_step(request: Request, file: UploadFile = File(...)):
         slider_penalty = 45000.0 if has_u else 0.0
         mold_cost = float(28000.0 + (volume_mm3/1000 * 0.08) + slider_penalty)
 
-        # 4. Final Payload (All values explicitly cast to Python primitives)
         return {
             "glb_url": str(request.base_url).rstrip('/') + f"/static/{glb_filename}",
             "volume_cubic_mm": float(volume_mm3),
@@ -121,12 +110,11 @@ async def upload_step(request: Request, file: UploadFile = File(...)):
             "has_undercuts": bool(has_u),
             "optimal_axis": str(best_axis),
             "undercut_message": f"Optimal Pull: {best_axis}. " + 
-                               ("Side-actions (sliders) required." if has_u else "Straight-pull compatible.")
+                               ("Side-actions required." if has_u else "Straight-pull compatible.")
         }
 
     except Exception as e:
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        if tmp_step.exists():
-            tmp_step.unlink()
+        if tmp_step.exists(): tmp_step.unlink()
