@@ -1,5 +1,8 @@
-gradio
-numpy
+fastapi
+uvicorn
+python-multipart
 trimesh
-cadquery-ocp
-vtk
+numpy
+cascadio==0.0.13
+scipy
+
