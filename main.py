@@ -245,7 +245,7 @@ async def upload_step(file: UploadFile = File(...)):
         undercut_data = analyze_undercuts(mesh, step_features)
 
        
-return {
+        return {
             "glb_url": glb_url,
             "volume_cubic_mm": volume_cubic_mm,
             "bounding_box_mm": bounding_box_mm,
@@ -270,6 +270,7 @@ return {
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
 
 
 
