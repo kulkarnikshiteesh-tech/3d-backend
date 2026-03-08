@@ -1,8 +1,2 @@
-fastapi
-uvicorn
-python-multipart
-trimesh
+gradio
 numpy
-cascadio==0.0.13
-scipy
-rtree
