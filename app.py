@@ -1,13 +1,1 @@
-import gradio as gr
-
-def test_app(file, text):
-    return f'Thank you! File: {file.name if file else 'none'}, Text: {text}'
-
-demo = gr.Interface(
-    fn=test_app,
-    inputs=[gr.File(), gr.Textbox()],
-    outputs=gr.Textbox()
-)
-
-if __name__ == '__main__':
-    demo.launch(server_name='0.0.0.0', server_port=7860)
+import gradio as gr;def dfm(file,surface):return f"DFM for {surface}\\nFile size: {file.size if file else 0} bytes\\nStatus: Ready for STEP analysis!";gr.Interface(fn=dfm,inputs=[gr.File(),gr.Dropdown(["Top","Bottom"])],outputs=gr.Text()).launch(server_name="0.
