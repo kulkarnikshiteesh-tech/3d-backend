@@ -1,2 +1,4 @@
 gradio
+cadquery-ocp[cad]
+trimesh
 numpy
