@@ -48,18 +48,20 @@ async def health():
 
 def analyze_step_features(step_text: str) -> dict:
     """
-    Parse raw STEP file text to detect undercut-causing features
+    Parse raw STEP file text to detect undercut-causing features.
+    Only conical surfaces are flagged as true undercut indicators.
+    Through-holes and toroids are counted for info but NOT used to trigger undercut.
     """
     try:
-        # Count cylindrical surfaces — each is a potential hole/boss
+        # Count cylindrical surfaces
         cylinders = re.findall(r"CYLINDRICAL_SURFACE\s*\(", step_text, re.IGNORECASE)
         n_cylinders = len(cylinders)
 
-        # Count toroidal surfaces — fillets inside pockets are undercut risk
+        # Count toroidal surfaces (fillets/rounds — NOT undercuts, just info)
         toroids = re.findall(r"TOROIDAL_SURFACE\s*\(", step_text, re.IGNORECASE)
         n_toroids = len(toroids)
 
-        # Count conical surfaces — snap fits, undercut bosses
+        # Count conical surfaces — snap fits, angled bosses — TRUE undercut risk
         conicals = re.findall(r"CONICAL_SURFACE\s*\(", step_text, re.IGNORECASE)
         n_conicals = len(conicals)
 
@@ -73,7 +75,7 @@ def analyze_step_features(step_text: str) -> dict:
         n_likely_holes = sum(1 for r in radii_floats if r < 15.0)
         n_likely_bosses = sum(1 for r in radii_floats if r >= 15.0)
 
-        # Through-hole detection: cylinder referenced by EXACTLY 2 faces (sidewall only)
+        # Through-hole count — informational only, NOT an undercut trigger
         cyl_ids = re.findall(
             r"#(\d+)\s*=\s*CYLINDRICAL_SURFACE\s*\(",
             step_text,
@@ -82,13 +84,11 @@ def analyze_step_features(step_text: str) -> dict:
         through_hole_count = 0
         for cid in cyl_ids:
             refs = re.findall(rf"ADVANCED_FACE\s*\([^)]*#{cid}[^)]*\)", step_text)
-            # EXACTLY 2 faces = through-hole (2 sidewalls). More = blind hole with bottom
             if len(refs) == 2:
                 through_hole_count += 1
 
-        has_undercut_features = (
-            through_hole_count > 0 or n_conicals > 0
-        )
+        # Only conical surfaces are a reliable STEP-level undercut signal
+        has_undercut_features = n_conicals > 0
 
         return {
             "step_cylinders": n_cylinders,
@@ -106,6 +106,17 @@ def analyze_step_features(step_text: str) -> dict:
 
 
 def analyze_undercuts(mesh, step_features: dict) -> dict:
+    """
+    Determine if the part has true undercuts that require side-action tooling.
+
+    Strategy:
+    - Use 6-axis mesh ray analysis with a strict threshold (dot > 0.0) to
+      identify faces genuinely unreachable from any straight-pull direction.
+    - Only flag as undercut if BOTH the mesh ratio is significant AND
+      conical STEP features are present — or if the mesh ratio alone is
+      very high (>10%), indicating a clearly complex geometry.
+    - Through-holes and fillets (toroids) are explicitly excluded as triggers.
+    """
     try:
         if hasattr(mesh, 'dump'):
             meshes = mesh.dump()
@@ -115,6 +126,7 @@ def analyze_undercuts(mesh, step_features: dict) -> dict:
         areas = np.array(mesh.area_faces)
         total_area = float(np.sum(areas))
 
+        # 6 primary pull directions for straight-pull mold analysis
         directions = [
             np.array([0, 0, 1]),
             np.array([0, 0, -1]),
@@ -124,73 +136,95 @@ def analyze_undercuts(mesh, step_features: dict) -> dict:
             np.array([0, -1, 0]),
         ]
 
+        # Strict threshold: dot > 0.0 means any face with ANY component
+        # in a pull direction is considered reachable. This avoids false positives
+        # on near-vertical walls that are actually fine for straight-pull molds.
         reachable = np.zeros(len(normals), dtype=bool)
         for d in directions:
             dot = np.dot(normals, d)
-            reachable |= (dot > 0.25)
+            reachable |= (dot > 0.0)
 
-        unreachable_area = float(np.sum(areas[~reachable]))
+        unreachable_mask = ~reachable
+        unreachable_area = float(np.sum(areas[unreachable_mask]))
         ratio = unreachable_area / total_area if total_area > 0 else 0
         pct = ratio * 100
+        unreachable_count = int(np.sum(unreachable_mask))
 
-        # STEP features override mesh analysis if they clearly detect undercuts
-        step_override = step_features.get("step_has_undercut_features", False)
-        through_holes = step_features.get("step_through_holes", 0)
-        toroids = step_features.get("step_toroids", 0)
+        # STEP feature context
+        has_step_undercut = step_features.get("step_has_undercut_features", False)
         conicals = step_features.get("step_conicals", 0)
 
-        if step_override:
+        print(f"Undercut mesh ratio: {pct:.2f}%, step_conicals: {conicals}, step_override: {has_step_undercut}")
+
+        # --- Decision logic ---
+
+        # HIGH confidence undercut: mesh ratio is very high (>10%) regardless of STEP
+        # This catches truly complex geometry even without STEP metadata
+        if ratio > 0.10:
+            return {
+                "has_undercuts": True,
+                "undercut_face_count": unreachable_count,
+                "undercut_severity": "high",
+                "undercut_message": (
+                    f"Undercut detected — {pct:.1f}% of surface area is unreachable "
+                    f"from any straight-pull direction. Side-action sliders or lifters "
+                    f"required, increasing tooling cost by ~25–40%."
+                ),
+            }
+
+        # MEDIUM confidence: mesh ratio is moderate AND conical STEP features confirm it
+        if ratio > 0.04 and has_step_undercut:
             details = []
-            if through_holes > 0:
-                details.append(f"{through_holes} through-hole(s)")
-            if toroids > 0:
-                details.append(f"{toroids} internal fillet(s)/pocket(s)")
             if conicals > 0:
                 details.append(f"{conicals} conical feature(s)")
-            feature_str = ", ".join(details)
-
+            feature_str = f" ({', '.join(details)})" if details else ""
             return {
                 "has_undercuts": True,
-                "undercut_face_count": int(np.sum(~reachable)),
+                "undercut_face_count": unreachable_count,
                 "undercut_severity": "high",
                 "undercut_message": (
-                    f"Undercut detected — {feature_str} found in STEP geometry. "
-                    f"Side-action sliders or lifters required, increasing tooling cost by ~25–40%."
+                    f"Undercut detected — {pct:.1f}% unreachable surface area "
+                    f"confirmed by STEP geometry{feature_str}. "
+                    f"Side-action sliders required, increasing tooling cost by ~25–40%."
                 ),
             }
 
-        # Fall back to mesh ratio analysis
-        if ratio > 0.03:
+        # POSSIBLE undercut: moderate mesh ratio but no strong STEP confirmation
+        if ratio > 0.04:
             return {
                 "has_undercuts": True,
-                "undercut_face_count": int(np.sum(~reachable)),
-                "undercut_severity": "high",
-                "undercut_message": (
-                    f"Undercut detected — {pct:.1f}% of surface area unreachable "
-                    f"from any pull direction. Side-action sliders required, "
-                    f"increasing tooling cost by ~25–40%."
-                ),
-            }
-        elif ratio > 0.015:
-            return {
-                "has_undercuts": True,
-                "undercut_face_count": int(np.sum(~reachable)),
+                "undercut_face_count": unreachable_count,
                 "undercut_severity": "moderate",
                 "undercut_message": (
-                    f"Possible undercut — {pct:.1f}% of surface area may need sliders. "
-                    f"Review side holes or internal features."
+                    f"Possible undercut — {pct:.1f}% of surface area may be difficult "
+                    f"to reach from straight-pull directions. Review side holes or "
+                    f"internal features manually."
                 ),
             }
-        else:
+
+        # STEP-only signal (conicals present but mesh ratio is low)
+        # Flag as moderate — conicals are real but geometry may still be mouldable
+        if has_step_undercut:
             return {
-                "has_undercuts": False,
-                "undercut_face_count": 0,
-                "undercut_severity": "low",
+                "has_undercuts": True,
+                "undercut_face_count": unreachable_count,
+                "undercut_severity": "moderate",
                 "undercut_message": (
-                    f"No undercut risk — {pct:.1f}% unreachable area. "
-                    f"Part is compatible with straight-pull mold."
+                    f"Possible undercut — {conicals} conical surface(s) detected in STEP "
+                    f"geometry. Verify if angled features require side-action tooling."
                 ),
             }
+
+        # No undercut
+        return {
+            "has_undercuts": False,
+            "undercut_face_count": 0,
+            "undercut_severity": "low",
+            "undercut_message": (
+                f"No undercut risk — {pct:.1f}% unreachable area is within tolerance. "
+                f"Part is compatible with a straight-pull mold."
+            ),
+        }
 
     except Exception as e:
         print(f"Undercut error: {type(e).__name__}: {str(e)}")
@@ -244,7 +278,6 @@ async def upload_step(file: UploadFile = File(...)):
 
         undercut_data = analyze_undercuts(mesh, step_features)
 
-       
         return {
             "glb_url": glb_url,
             "volume_cubic_mm": volume_cubic_mm,
@@ -270,9 +303,3 @@ async def upload_step(file: UploadFile = File(...)):
                 tmp_step_path.unlink()
             except Exception:
                 pass
-
-
-
-
-
-
