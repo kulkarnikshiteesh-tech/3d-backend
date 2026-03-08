@@ -246,13 +246,11 @@ async def upload_step(file: UploadFile = File(...)):
 
        
 return {
-    "glb_url": glb_url,
-    "volume_cubic_mm": volume_cubic_mm,
-    "bounding_box_mm": bounding_box_mm,
-    "mold_cost": your_mold_cost_calculation_here,
-    "part_cost": your_part_cost_calculation_here,
-    **undercut_data,
-}
+            "glb_url": glb_url,
+            "volume_cubic_mm": volume_cubic_mm,
+            "bounding_box_mm": bounding_box_mm,
+            **undercut_data,
+        }
     except HTTPException:
         raise
     except Exception:
@@ -272,6 +270,7 @@ return {
                 tmp_step_path.unlink()
             except Exception:
                 pass
+
 
 
 
