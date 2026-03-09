@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -10,6 +11,7 @@ from uuid import uuid4
 
 import cascadio
 import trimesh
+import trimesh.visual
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,7 +48,7 @@ async def health():
     return {"status": "ok"}
 
 
-# ── Pydantic model for reanalyze request ──────────────────────────────────────
+# ── Pydantic models ───────────────────────────────────────────────────────────
 
 class PullDirection(BaseModel):
     x: float
@@ -86,7 +88,6 @@ def analyze_step_features(step_text: str) -> dict:
             if len(refs) == 2:
                 through_hole_count += 1
 
-        # Only conicals are a true undercut signal — through-holes are NOT
         has_undercut_features = n_conicals > 0
 
         return {
@@ -104,14 +105,90 @@ def analyze_step_features(step_text: str) -> dict:
         return {"step_has_undercut_features": False}
 
 
+# ── Assembly & moldability validator ─────────────────────────────────────────
+
+def validate_part(step_text: str, mesh) -> dict | None:
+    """
+    Returns an error dict if the part fails validation, or None if it's clean.
+    Checks: assembly, aspect ratio, negative volume, absolute thin wall.
+    """
+
+    # 1. Assembly detection — count distinct solid bodies
+    solid_bodies = re.findall(
+        r"MANIFOLD_SOLID_BREP\s*\(|CLOSED_SHELL\s*\(",
+        step_text, re.IGNORECASE
+    )
+    # Heuristic: CLOSED_SHELL count > 2 strongly suggests assembly
+    closed_shells = re.findall(r"CLOSED_SHELL\s*\(", step_text, re.IGNORECASE)
+    if len(closed_shells) > 2:
+        return {
+            "error": "assembly",
+            "message": (
+                f"This looks like an assembly with {len(closed_shells)} separate bodies. "
+                f"Please upload individual parts one at a time for accurate DFM analysis."
+            ),
+        }
+
+    # 2. Get bounding box dimensions from mesh
+    try:
+        extents = mesh.extents if hasattr(mesh, "extents") else None
+        if extents is not None:
+            dims_mm = sorted([
+                float(extents[0]) * 1000.0,
+                float(extents[1]) * 1000.0,
+                float(extents[2]) * 1000.0,
+            ])
+            smallest, largest = dims_mm[0], dims_mm[2]
+
+            # 3. Aspect ratio check — pencil/rod/thin sheet guard
+            if smallest > 0 and (largest / smallest) > 15:
+                return {
+                    "error": "not_moldable",
+                    "message": (
+                        f"This part has an extreme aspect ratio "
+                        f"({largest:.1f}mm vs {smallest:.1f}mm). "
+                        f"It looks like an extruded, turned, or sheet metal part — "
+                        f"injection molding is unlikely to be the right process for this geometry."
+                    ),
+                }
+
+            # 4. Absolute thin wall — smallest dimension < 0.5mm
+            if smallest < 0.5:
+                return {
+                    "error": "not_moldable",
+                    "message": (
+                        f"The smallest dimension of this part is {smallest:.2f}mm, "
+                        f"which is below the minimum wall thickness for injection molding (0.5mm). "
+                        f"Please review your geometry."
+                    ),
+                }
+    except Exception as e:
+        print(f"Validation dimension error: {e}")
+
+    # 5. Negative or zero volume — inside-out or empty mesh
+    try:
+        vol = float(mesh.volume) if hasattr(mesh, "volume") else 0.0
+        if vol <= 0:
+            return {
+                "error": "geometry_error",
+                "message": (
+                    "The model has a geometry error (invalid or zero volume). "
+                    "This usually means the mesh is inside-out or has open surfaces. "
+                    "Try re-exporting from your CAD tool with 'Export as solid' enabled."
+                ),
+            }
+    except Exception as e:
+        print(f"Validation volume error: {e}")
+
+    return None  # all checks passed
+
+
 # ── Undercut analyser ─────────────────────────────────────────────────────────
 
 def analyze_undercuts(mesh, step_features: dict, pull_direction: list | None = None) -> dict:
     """
     Analyse undercuts relative to a given pull direction.
-
-    If pull_direction is provided (user-confirmed surface), only that axis
-    and its opposite are used. Otherwise all 6 axes are tested.
+    Returns undercut data including face indices of unreachable faces.
     """
     try:
         if hasattr(mesh, "dump"):
@@ -122,7 +199,6 @@ def analyze_undercuts(mesh, step_features: dict, pull_direction: list | None = N
         areas = np.array(mesh.area_faces)
         total_area = float(np.sum(areas))
 
-        # Build direction set
         if pull_direction is not None:
             pd = np.array(pull_direction, dtype=float)
             pd = pd / np.linalg.norm(pd)
@@ -141,21 +217,25 @@ def analyze_undercuts(mesh, step_features: dict, pull_direction: list | None = N
         for d in directions:
             reachable |= (np.dot(normals, d) > 0.0)
 
-        unreachable_area = float(np.sum(areas[~reachable]))
+        unreachable_mask = ~reachable
+        unreachable_area = float(np.sum(areas[unreachable_mask]))
         ratio = unreachable_area / total_area if total_area > 0 else 0
         pct = ratio * 100
-        unreachable_count = int(np.sum(~reachable))
+        unreachable_count = int(np.sum(unreachable_mask))
+
+        # Face indices for highlighting
+        undercut_face_indices = np.where(unreachable_mask)[0].tolist()
 
         step_has_undercut = step_features.get("step_has_undercut_features", False)
         conicals = step_features.get("step_conicals", 0)
 
         print(f"Undercut: ratio={pct:.2f}%, conicals={conicals}, pull={pull_direction}")
 
-        # High confidence — mesh ratio alone is conclusive
         if ratio > 0.10:
             return {
                 "has_undercuts": True,
                 "undercut_face_count": unreachable_count,
+                "undercut_face_indices": undercut_face_indices,
                 "undercut_severity": "high",
                 "undercut_message": (
                     f"Undercut detected — {pct:.1f}% of surface area unreachable "
@@ -164,11 +244,11 @@ def analyze_undercuts(mesh, step_features: dict, pull_direction: list | None = N
                 ),
             }
 
-        # Confirmed by both mesh and STEP conicals
         if ratio > 0.04 and step_has_undercut:
             return {
                 "has_undercuts": True,
                 "undercut_face_count": unreachable_count,
+                "undercut_face_indices": undercut_face_indices,
                 "undercut_severity": "high",
                 "undercut_message": (
                     f"Undercut detected — {pct:.1f}% unreachable area confirmed by "
@@ -177,11 +257,11 @@ def analyze_undercuts(mesh, step_features: dict, pull_direction: list | None = N
                 ),
             }
 
-        # Moderate mesh signal alone
         if ratio > 0.04:
             return {
                 "has_undercuts": True,
                 "undercut_face_count": unreachable_count,
+                "undercut_face_indices": undercut_face_indices,
                 "undercut_severity": "moderate",
                 "undercut_message": (
                     f"Possible undercut — {pct:.1f}% of surface area may be difficult "
@@ -189,11 +269,11 @@ def analyze_undercuts(mesh, step_features: dict, pull_direction: list | None = N
                 ),
             }
 
-        # STEP-only signal — conicals but low mesh ratio
         if step_has_undercut:
             return {
                 "has_undercuts": True,
                 "undercut_face_count": unreachable_count,
+                "undercut_face_indices": undercut_face_indices,
                 "undercut_severity": "moderate",
                 "undercut_message": (
                     f"Possible undercut — {conicals} conical surface(s) detected. "
@@ -201,10 +281,10 @@ def analyze_undercuts(mesh, step_features: dict, pull_direction: list | None = N
                 ),
             }
 
-        # Clean
         return {
             "has_undercuts": False,
             "undercut_face_count": 0,
+            "undercut_face_indices": [],
             "undercut_severity": "low",
             "undercut_message": (
                 f"No undercut risk — {pct:.1f}% unreachable area is within tolerance. "
@@ -218,9 +298,48 @@ def analyze_undercuts(mesh, step_features: dict, pull_direction: list | None = N
         return {
             "has_undercuts": None,
             "undercut_face_count": None,
+            "undercut_face_indices": [],
             "undercut_severity": "unknown",
             "undercut_message": "Undercut analysis could not be completed for this part.",
         }
+
+
+# ── Colored GLB exporter ──────────────────────────────────────────────────────
+
+def export_colored_glb(source_glb: Path, undercut_face_indices: list[int], output_glb: Path):
+    """
+    Load the source GLB, color undercut faces orange and clean faces blue,
+    then export to output_glb.
+    Falls back to copying source if coloring fails.
+    """
+    try:
+        mesh = trimesh.load(str(source_glb), force="mesh")
+
+        if hasattr(mesh, "dump"):
+            meshes = mesh.dump()
+            mesh = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
+
+        n_faces = len(mesh.faces)
+
+        # Build per-face color array — RGBA uint8
+        # Default: blue #3b6bca
+        colors = np.full((n_faces, 4), [59, 107, 202, 255], dtype=np.uint8)
+
+        # Undercut faces: orange #f97316
+        if undercut_face_indices:
+            idx = np.array(undercut_face_indices, dtype=int)
+            # Clamp to valid range
+            idx = idx[idx < n_faces]
+            colors[idx] = [249, 115, 22, 255]
+
+        mesh.visual = trimesh.visual.ColorVisuals(mesh=mesh, face_colors=colors)
+        mesh.export(str(output_glb))
+        print(f"Colored GLB exported: {output_glb.name} "
+              f"({len(undercut_face_indices)} undercut faces highlighted)")
+
+    except Exception as e:
+        print(f"Colored GLB export failed: {e} — falling back to source GLB")
+        shutil.copy2(str(source_glb), str(output_glb))
 
 
 # ── /upload endpoint ──────────────────────────────────────────────────────────
@@ -234,9 +353,12 @@ async def upload_step(file: UploadFile = File(...)):
 
     os.makedirs("static", exist_ok=True)
 
-    tmp_step_path = Path(tempfile.gettempdir()) / f"{uuid4()}{suffix}"
-    glb_name = f"{uuid4()}.glb"
-    glb_path = STATIC_DIR / glb_name
+    uid = str(uuid4())
+    tmp_step_path = Path(tempfile.gettempdir()) / f"{uid}{suffix}"
+    raw_glb_path = STATIC_DIR / f"{uid}_raw.glb"
+    colored_glb_name = f"{uid}.glb"
+    colored_glb_path = STATIC_DIR / colored_glb_name
+    meta_path = STATIC_DIR / f"{uid}.json"
 
     try:
         with tmp_step_path.open("wb") as f:
@@ -246,13 +368,19 @@ async def upload_step(file: UploadFile = File(...)):
         step_features = analyze_step_features(step_text)
         print(f"STEP features: {step_features}")
 
-        result = cascadio.step_to_glb(str(tmp_step_path), str(glb_path))
+        # Convert STEP → raw GLB
+        result = cascadio.step_to_glb(str(tmp_step_path), str(raw_glb_path))
         if result != 0:
             raise RuntimeError(f"cascadio conversion failed with code {result}")
 
-        mesh = trimesh.load(str(glb_path), force="mesh")
-        glb_url = f"/static/{glb_name}"
+        mesh = trimesh.load(str(raw_glb_path), force="mesh")
 
+        # ── Validation ────────────────────────────────────────────────────────
+        validation_error = validate_part(step_text, mesh)
+        if validation_error:
+            return JSONResponse(status_code=422, content=validation_error)
+
+        # ── Dimensions ───────────────────────────────────────────────────────
         raw_volume_m3 = float(mesh.volume) if hasattr(mesh, "volume") and mesh.volume else 0.0
         volume_cubic_mm = raw_volume_m3 * 1e9
 
@@ -263,22 +391,37 @@ async def upload_step(file: UploadFile = File(...)):
             "z": float(raw_extents_m[2] * 1000.0),
         }
 
+        # ── Undercut analysis ─────────────────────────────────────────────────
         undercut_data = analyze_undercuts(mesh, step_features, pull_direction=None)
 
+        # ── Colored GLB export ────────────────────────────────────────────────
+        export_colored_glb(raw_glb_path, undercut_data.get("undercut_face_indices", []), colored_glb_path)
+
+        # ── Persist STEP features for reanalyze ──────────────────────────────
+        meta_path.write_text(json.dumps(step_features))
+
+        # Clean up raw GLB
+        try:
+            raw_glb_path.unlink()
+        except Exception:
+            pass
+
         return {
-            "glb_url": glb_url,
+            "glb_url": f"/static/{colored_glb_name}",
             "volume_cubic_mm": volume_cubic_mm,
             "bounding_box_mm": bounding_box_mm,
             **undercut_data,
         }
+
     except HTTPException:
         raise
     except Exception:
-        if glb_path.exists():
-            try:
-                glb_path.unlink()
-            except Exception:
-                pass
+        for p in [raw_glb_path, colored_glb_path, meta_path]:
+            if p.exists():
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
         raise
     finally:
         try:
@@ -298,20 +441,40 @@ async def upload_step(file: UploadFile = File(...)):
 async def reanalyze(req: ReanalyzeRequest):
     """
     Re-run undercut analysis using a user-confirmed pull direction.
-    The GLB already exists in /static — no re-conversion needed.
+    Reloads persisted STEP features, re-colors the GLB with updated undercut faces.
     """
-    glb_path = STATIC_DIR / req.glb_filename
+    uid = req.glb_filename.replace(".glb", "")
+    colored_glb_path = STATIC_DIR / req.glb_filename
+    meta_path = STATIC_DIR / f"{uid}.json"
 
-    if not glb_path.exists():
-        raise HTTPException(status_code=404, detail="GLB file not found. Please re-upload the model.")
+    # We always re-export a new colored GLB — load from a temp raw copy if needed
+    # Since we deleted the raw GLB, we reload the existing colored one as source
+    if not colored_glb_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="GLB file not found. Please re-upload the model."
+        )
 
     try:
-        mesh = trimesh.load(str(glb_path), force="mesh")
-
+        mesh = trimesh.load(str(colored_glb_path), force="mesh")
         pull = [req.pull_direction.x, req.pull_direction.y, req.pull_direction.z]
 
-        # No STEP features available at reanalyze time — pass empty dict
-        undercut_data = analyze_undercuts(mesh, {}, pull_direction=pull)
+        # Reload persisted STEP features
+        step_features = {}
+        if meta_path.exists():
+            try:
+                step_features = json.loads(meta_path.read_text())
+            except Exception:
+                pass
+
+        undercut_data = analyze_undercuts(mesh, step_features, pull_direction=pull)
+
+        # Re-export colored GLB with updated undercut faces
+        export_colored_glb(
+            colored_glb_path,
+            undercut_data.get("undercut_face_indices", []),
+            colored_glb_path   # overwrite in place
+        )
 
         raw_volume_m3 = float(mesh.volume) if hasattr(mesh, "volume") and mesh.volume else 0.0
         volume_cubic_mm = raw_volume_m3 * 1e9
@@ -323,8 +486,12 @@ async def reanalyze(req: ReanalyzeRequest):
             "z": float(raw_extents_m[2] * 1000.0),
         }
 
+        # Add cache-bust timestamp so frontend reloads the updated GLB
+        from time import time
+        glb_url = f"/static/{req.glb_filename}?t={int(time())}"
+
         return {
-            "glb_url": f"/static/{req.glb_filename}",
+            "glb_url": glb_url,
             "volume_cubic_mm": volume_cubic_mm,
             "bounding_box_mm": bounding_box_mm,
             **undercut_data,
