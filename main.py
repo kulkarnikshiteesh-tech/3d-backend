@@ -101,34 +101,36 @@ def analyze_step_features(step_text: str) -> dict:
 def detect_step_parts(step_text: str) -> dict:
     """
     Detect if a STEP file contains multiple parts or is an assembly.
-    Returns: { is_assembly: bool, part_count: int, error_code: str | None }
+    Handles both MANIFOLD_SOLID_BREP and SHELL_BASED_SURFACE_MODEL schemas.
     """
-    # NEXT_ASSEMBLY_USAGE_OCCURENCE is only present in assemblies
+    # NEXT_ASSEMBLY_USAGE_OCCURENCE — explicit assembly relationship
     nauo = re.findall(
         r"NEXT_ASSEMBLY_USAGE_OCCURENCE\s*\(", step_text, re.IGNORECASE
     )
-    # Count PRODUCT entries — each part/body has one
-    products = re.findall(
-        r"=\s*PRODUCT\s*\(", step_text, re.IGNORECASE
-    )
-    # Count manifold solid bodies
+    # MANIFOLD_SOLID_BREP — standard solid bodies
     solids = re.findall(
         r"MANIFOLD_SOLID_BREP\s*\(", step_text, re.IGNORECASE
     )
+    # CLOSED_SHELL — works for both MANIFOLD and SHELL_BASED schemas
+    closed_shells = re.findall(
+        r"=\s*CLOSED_SHELL\s*\(", step_text, re.IGNORECASE
+    )
 
-    part_count = max(len(products), len(solids))
+    n_solids = len(solids)
+    n_shells = len(closed_shells)
+    n_bodies = max(n_solids, n_shells)
     is_assembly = len(nauo) > 0
 
     if is_assembly:
         return {
             "is_assembly": True,
-            "part_count": len(products),
+            "part_count": n_bodies,
             "error_code": "assembly",
         }
-    if len(solids) > 1:
+    if n_bodies > 1:
         return {
             "is_assembly": False,
-            "part_count": len(solids),
+            "part_count": n_bodies,
             "error_code": "multiple_parts",
         }
     return {
