@@ -96,6 +96,48 @@ def analyze_step_features(step_text: str) -> dict:
         return {"step_has_undercut_features": False}
 
 
+# ── Assembly / multi-part detector ───────────────────────────────────────────
+
+def detect_step_parts(step_text: str) -> dict:
+    """
+    Detect if a STEP file contains multiple parts or is an assembly.
+    Returns: { is_assembly: bool, part_count: int, error_code: str | None }
+    """
+    # NEXT_ASSEMBLY_USAGE_OCCURENCE is only present in assemblies
+    nauo = re.findall(
+        r"NEXT_ASSEMBLY_USAGE_OCCURENCE\s*\(", step_text, re.IGNORECASE
+    )
+    # Count PRODUCT entries — each part/body has one
+    products = re.findall(
+        r"=\s*PRODUCT\s*\(", step_text, re.IGNORECASE
+    )
+    # Count manifold solid bodies
+    solids = re.findall(
+        r"MANIFOLD_SOLID_BREP\s*\(", step_text, re.IGNORECASE
+    )
+
+    part_count = max(len(products), len(solids))
+    is_assembly = len(nauo) > 0
+
+    if is_assembly:
+        return {
+            "is_assembly": True,
+            "part_count": len(products),
+            "error_code": "assembly",
+        }
+    if len(solids) > 1:
+        return {
+            "is_assembly": False,
+            "part_count": len(solids),
+            "error_code": "multiple_parts",
+        }
+    return {
+        "is_assembly": False,
+        "part_count": 1,
+        "error_code": None,
+    }
+
+
 # ── Memory-safe mesh loader ───────────────────────────────────────────────────
 
 def load_mesh_safe(path: str) -> trimesh.Trimesh:
@@ -258,15 +300,46 @@ async def upload_step(file: UploadFile = File(...)):
         step_text     = tmp_step_path.read_text(errors="ignore")
         step_features = analyze_step_features(step_text)
         print(f"STEP features: {step_features}")
+
+        # 3. Assembly / multi-part check ──────────────────────────────
+        part_info = detect_step_parts(step_text)
+        if part_info["error_code"] == "assembly":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "assembly",
+                    "part_count": part_info["part_count"],
+                    "message": (
+                        f"This file contains {part_info['part_count']} parts assembled together. "
+                        f"Makeable analyses single parts only. "
+                        f"Open your CAD software, isolate one part, and export it as a separate STEP file."
+                    ),
+                }
+            )
+        if part_info["error_code"] == "multiple_parts":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "multiple_parts",
+                    "part_count": part_info["part_count"],
+                    "message": (
+                        f"This file contains {part_info['part_count']} separate bodies. "
+                        f"Makeable analyses one body at a time. "
+                        f"Export each body as its own STEP file and upload them one by one."
+                    ),
+                }
+            )
+        # ─────────────────────────────────────────────────────────────
+
         del step_text
         gc.collect()
 
-        # 3. Convert STEP → GLB
+        # 4. Convert STEP → GLB
         result = cascadio.step_to_glb(str(tmp_step_path), str(glb_path))
         if result != 0:
             raise RuntimeError(f"cascadio conversion failed with code {result}")
 
-        # 4. Load mesh safely and immediately free cascadio objects
+        # 5. Load mesh safely and immediately free cascadio objects
         mesh = load_mesh_safe(str(glb_path))
 
         raw_volume_m3  = float(mesh.volume) if hasattr(mesh, "volume") and mesh.volume else 0.0
@@ -278,10 +351,10 @@ async def upload_step(file: UploadFile = File(...)):
             "z": float(raw_extents_m[2] * 1000.0),
         }
 
-        # 5. Undercut analysis (no pull direction on initial upload)
+        # 6. Undercut analysis (no pull direction on initial upload)
         undercut_data = analyze_undercuts(mesh, step_features, pull_direction=None)
 
-        # 6. Free mesh now — we're done with it
+        # 7. Free mesh now — we're done with it
         del mesh
         gc.collect()
 
