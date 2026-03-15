@@ -6,4 +6,4 @@ numpy
 cascadio==0.0.13
 scipy
 pygltflib
-supabase==2.3.0
+supabase==2.7.4
