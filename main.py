@@ -9,6 +9,12 @@ import traceback
 from pathlib import Path
 from uuid import uuid4
 
+from supabase import create_client, Client
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+supabase: Client | None = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
 import cascadio
 import trimesh
 import numpy as np
@@ -359,6 +365,29 @@ async def upload_step(file: UploadFile = File(...)):
         # 7. Free mesh now — we're done with it
         del mesh
         gc.collect()
+
+        # ── Supabase logging ─────────────────────────────────────────
+        if supabase:
+            try:
+                wall_est = min(bounding_box_mm["x"], bounding_box_mm["y"], bounding_box_mm["z"]) / 10
+                supabase.table("uploads").insert({
+                    "volume_mm3":         volume_cubic_mm,
+                    "bbox_x":             bounding_box_mm["x"],
+                    "bbox_y":             bounding_box_mm["y"],
+                    "bbox_z":             bounding_box_mm["z"],
+                    "wall_est":           wall_est,
+                    "step_cylinders":     step_features.get("step_cylinders", 0),
+                    "step_through_holes": step_features.get("step_through_holes", 0),
+                    "step_conicals":      step_features.get("step_conicals", 0),
+                    "step_likely_holes":  step_features.get("step_likely_holes", 0),
+                    "step_likely_bosses": step_features.get("step_likely_bosses", 0),
+                    "undercut_severity":  undercut_data.get("undercut_severity"),
+                    "undercut_pct":       undercut_data.get("undercut_face_count", 0),
+                    "undercut_face_count":undercut_data.get("undercut_face_count", 0),
+                }).execute()
+            except Exception as log_err:
+                print(f"Supabase log error (non-fatal): {log_err}")
+        # ─────────────────────────────────────────────────────────────
 
         return {
             "glb_url":        f"/static/{glb_name}",
